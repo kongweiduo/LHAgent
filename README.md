@@ -22,24 +22,6 @@ LHAgent 聚焦于 Agent harness 的基础能力，以轻量、直接的实现提
 
 ## 🚀 快速开始
 
-### Linux 独立运行包
-
-不需要安装项目依赖时，可从 [`packaging/dist`](packaging/dist) 下载与机器架构匹配的
-`lhagent-0.53.0-linux-amd64.tar.gz` 或 `lhagent-0.53.0-linux-arm64.tar.gz`。
-运行包包含独立的 Python 3.12 和 LHAgent 依赖，适用于 glibc Linux；macOS 不能直接运行。
-下载同名 `.sha256` 文件后，在包所在目录校验并解压：
-
-```sh
-sha256sum -c lhagent-0.53.0-linux-amd64.tar.gz.sha256
-tar -xzf lhagent-0.53.0-linux-amd64.tar.gz
-./lhagent/lhagent --bundle-check
-./lhagent/lhagent --help
-```
-
-arm64 机器将命令中的 `amd64` 换成 `arm64`。`--bundle-check` 不调用模型。
-解压后可运行 `./lhagent/install.sh /absolute/path/to/bin` 创建命令软链接；
-安装后需保留解压目录。
-
 ### 从源码运行
 
 #### 环境要求
@@ -59,8 +41,8 @@ uv sync
 
 ```sh
 cp lhagent.example.toml lhagent.toml
+cp swebench.example.toml swebench.toml
 cp .example.env .env
-mkdir -p manual-workspace
 ```
 
 在 `lhagent.toml` 中填写实际的模型名称、上下文窗口和最大输出 token 数；示例配置中的 `tools = []` 表示禁用工具，删除这一行即可启用全部内置工具。工作目录由 `cwd` 指定，使用其他路径时需先创建对应目录。
@@ -82,6 +64,7 @@ uv run lhagent --config lhagent.toml
 在项目根目录运行以下命令，使用已提供的运行包随机抽取 3 道任务进行测评：
 
 ```sh
+set -a; source .env; set +a
 uv run --with datasets --with swebench python -m lhagent.evals.benchmarks.swebench.adapter \
   --bundle packaging/dist \
   --config swebench.toml \
@@ -90,7 +73,9 @@ uv run --with datasets --with swebench python -m lhagent.evals.benchmarks.sweben
 
 评测按题串行执行：做题 → 官方评分 → 保存结果 → 清理本轮容器和新增题目镜像。
 失败时也会清理，运行前已有镜像保留；清理失败则停止后续题目，防止磁盘继续累积。
-不支持断点续跑。详细行为见 [SWE-bench 说明](src/lhagent/evals/benchmarks/swebench/README.md)。
+不支持断点续跑。每次运行的预测、评分报告和日志保存在 `swebench/<run_id>/`，
+每题的原始会话 JSONL 保存在 `swebench/<run_id>/.lhagent/<task_id>/sessions/`，
+可以直接查看其中的模型消息和工具调用记录。
 
 ## 🎯 项目亮点
 

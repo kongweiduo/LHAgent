@@ -10,11 +10,13 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import re
 import subprocess
 import sys
 import tomllib
 import uuid
 from collections.abc import Sequence
+from contextlib import chdir
 from pathlib import Path
 from typing import Any
 
@@ -129,6 +131,7 @@ def run_agent(
     instruction: str | None,
     timeout: int,
     log_dir: Path,
+    trace_dir: Path,
     platform: str,
     container_label: str = "lhagent.swebench=standalone",
 ) -> str:
@@ -145,6 +148,7 @@ def run_agent(
             + str(instance.get("problem_statement", ""))
         )
     )
+    trace_ready = False
     try:
         _run(
             [
@@ -171,6 +175,8 @@ def run_agent(
         _docker_exec(name, ["sh", "-c", "mkdir -p /opt && tar -xzf /tmp/lhagent.tar.gz -C /opt"])
         _docker_exec(name, ["/opt/lhagent/lhagent", "--bundle-check"])
         _run(["docker", "cp", str(config), f"{name}:/tmp/lhagent.toml"])
+        _docker_exec(name, ["mkdir", "-p", "/tmp/.lhagent"])
+        trace_ready = True
         result = subprocess.run(
             [
                 "docker",
@@ -214,7 +220,12 @@ def run_agent(
             workdir="/testbed",
         )
     finally:
-        subprocess.run(["docker", "rm", "-f", name], check=False, stdout=subprocess.DEVNULL)
+        try:
+            if trace_ready:
+                trace_dir.mkdir(parents=True, exist_ok=True)
+                _run(["docker", "cp", f"{name}:/tmp/.lhagent/.", str(trace_dir)])
+        finally:
+            subprocess.run(["docker", "rm", "-f", name], check=False, stdout=subprocess.DEVNULL)
 
 
 def cleanup_task(image: str, container_label: str, initial_images: set[str]) -> None:
@@ -244,7 +255,8 @@ def summarize_run(predictions_path: Path, selected: list[dict[str, Any]], run_id
         for line in predictions_path.read_text().splitlines()
         if (item := json.loads(line))
     }
-    return make_run_report(predictions, selected, run_id)
+    with chdir(predictions_path.parent):
+        return Path(make_run_report(predictions, selected, run_id)).resolve()
 
 
 def _load_dataset(name: str) -> list[dict[str, Any]]:
@@ -278,8 +290,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--instruction", help="override the generated issue prompt")
     parser.add_argument("--timeout", type=int, default=1800)
     parser.add_argument("--run-id", default=None)
-    parser.add_argument("--output", type=Path, default=Path("predictions.jsonl"))
-    parser.add_argument("--log-dir", type=Path, default=Path("logs/lhagent-swebench"))
+    parser.add_argument("--output-dir", type=Path, default=Path("swebench"))
     parser.add_argument(
         "--max-workers",
         type=int,
@@ -317,17 +328,22 @@ def main(argv: Sequence[str] | None = None) -> int:
     missing_images = [item["instance_id"] for item in selected if not item.get("image")]
     if missing_images:
         raise SystemExit("selected instances have no image: " + " ".join(missing_images))
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    initial_images = set(_run(["docker", "image", "ls", "--no-trunc", "-q"], capture=True).split())
     run_id = args.run_id or "lhagent-" + uuid.uuid4().hex[:10]
+    if re.fullmatch(r"[A-Za-z0-9_-]+", run_id) is None:
+        raise SystemExit("--run-id must contain only ASCII letters, digits, '_' or '-'")
+    run_dir = (args.output_dir / run_id).resolve()
+    run_dir.mkdir(parents=True, exist_ok=False)
+    output_path = run_dir / "predictions.jsonl"
+    log_dir = run_dir / "logs"
+    initial_images = set(_run(["docker", "image", "ls", "--no-trunc", "-q"], capture=True).split())
     # Independent of user-supplied run IDs, so concurrent runs cannot share labels.
     container_label = "lhagent.swebench=" + uuid.uuid4().hex
-    args.log_dir.mkdir(parents=True, exist_ok=True)
-    plan_path = args.log_dir / f"{run_id}.platforms.json"
-    failures_path = args.log_dir / f"{run_id}.failures.json"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    plan_path = log_dir / f"{run_id}.platforms.json"
+    failures_path = log_dir / f"{run_id}.failures.json"
     plans = {}
     errors = {}
-    with args.output.open("w", encoding="utf-8") as output:
+    with output_path.open("w", encoding="utf-8") as output:
         for number, instance in enumerate(selected, 1):
             instance_id = instance["instance_id"]
             image = _instance_image(instance)
@@ -346,7 +362,8 @@ def main(argv: Sequence[str] | None = None) -> int:
                     config=args.config,
                     instruction=args.instruction,
                     timeout=args.timeout,
-                    log_dir=args.log_dir,
+                    log_dir=log_dir,
+                    trace_dir=run_dir / ".lhagent" / instance_id,
                     container_label=container_label,
                 )
                 output.write(
@@ -375,7 +392,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "--split",
                         "test",
                         "--predictions_path",
-                        str(args.output),
+                        str(output_path),
                         "--run_id",
                         run_id,
                         "--max_workers",
@@ -386,10 +403,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                         instance_id,
                     ],
                     check=True,
+                    cwd=run_dir,
                 )
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
                 errors[instance_id] = str(exc)
-                (args.log_dir / f"{instance_id}.error.log").write_text(str(exc))
+                (log_dir / f"{instance_id}.error.log").write_text(str(exc))
                 print(f"{instance_id}: {exc}", file=sys.stderr, flush=True)
             finally:
                 try:
@@ -398,13 +416,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                     cleanup_failed = True
                     message = f"Docker cleanup failed: {exc}"
                     errors[instance_id] = errors.get(instance_id, "") + "\n" + message
-                    (args.log_dir / f"{instance_id}.error.log").write_text(errors[instance_id])
+                    (log_dir / f"{instance_id}.error.log").write_text(errors[instance_id])
                     print(message, file=sys.stderr, flush=True)
                 failures_path.write_text(json.dumps(errors, indent=2))
             if cleanup_failed:
                 print("Stopping before the next task because Docker cleanup failed.", flush=True)
                 break
-    report_path = summarize_run(args.output, selected, run_id)
+    report_path = summarize_run(output_path, selected, run_id)
     report = json.loads(report_path.read_text())
     for instance_id in report.get("error_ids", []):
         errors.setdefault(instance_id, "Official grading failed; see the evaluation logs")

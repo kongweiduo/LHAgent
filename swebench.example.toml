@@ -1,0 +1,17 @@
+# 本地个人配置，已加入 Git 忽略。通信参数填写在启动目录的 .env。
+[coding_agent]
+# 按实际服务商替换模型名称和容量。
+model = "deepseek-v4.1-flash"
+context_window = 256000
+max_output_tokens = 8192
+cwd = "/testbed"
+# 不设置 cwd：默认使用本 TOML 所在目录。
+# 不设置 tools：默认启用 read、ls、find、grep、write、edit、bash。
+# 显式指定时仅启用列表中的工具；tools = [] 禁用所有工具。
+# tools = ["read", "ls"]
+# 工具不受 cwd 沙箱限制，write/edit 可修改文件，bash 可执行命令。
+
+[coding_agent.compaction]
+enabled = true
+reserve_tokens = 10240
+keep_recent_tokens = 20480

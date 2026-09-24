@@ -56,12 +56,19 @@ def test_run_agent_captures_diff_without_agent_stdout(monkeypatch, tmp_path):
         instruction=None,
         timeout=60,
         log_dir=tmp_path / "logs",
+        trace_dir=tmp_path / ".lhagent/repo__issue-1",
     )
     assert commands[0][2:4] == ["--platform", "linux/amd64"]
     assert patch == "diff --git a/a b/a\n"
     assert (tmp_path / "logs/repo__issue-1.stdout.log").read_text() == "model response"
     assert any(
         command[:3] == ["docker", "exec", "-w"] and "/tmp" in command for command in commands
+    )
+    assert any(
+        command[:2] == ["docker", "cp"]
+        and command[2].endswith(":/tmp/.lhagent/.")
+        and command[3] == str(tmp_path / ".lhagent/repo__issue-1")
+        for command in commands
     )
     assert any("diff" in command and "HEAD" in command for command in commands)
     assert any(command[:3] == ["docker", "rm", "-f"] for command in commands)
@@ -90,15 +97,23 @@ def test_main_passes_only_selected_ids_to_official_grader(monkeypatch, tmp_path,
     monkeypatch.setattr(adapter, "_load_dataset", lambda _name: instances)
     monkeypatch.setattr(adapter, "_run", lambda *_args, **_kwargs: "linux/amd64\n")
     monkeypatch.setattr(adapter, "image_platforms", lambda _: {"linux/amd64"})
-    monkeypatch.setattr(adapter, "run_agent", lambda instance, **_kwargs: instance["instance_id"])
     grader_calls = []
+    grader_kwargs = []
+    solve_kwargs = []
+
+    def solve(instance, **kwargs):
+        solve_kwargs.append(kwargs)
+        return instance["instance_id"]
+
+    monkeypatch.setattr(adapter, "run_agent", solve)
 
     def fake_grader(command, **kwargs):
         grader_calls.append(command)
+        grader_kwargs.append(kwargs)
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(adapter.subprocess, "run", fake_grader)
-    output = tmp_path / "predictions.jsonl"
+    output = tmp_path / "swebench/test/predictions.jsonl"
     assert (
         adapter.main(
             [
@@ -109,10 +124,10 @@ def test_main_passes_only_selected_ids_to_official_grader(monkeypatch, tmp_path,
                 "--instance-ids",
                 "repo__issue-2",
                 "repo__issue-0",
-                "--log-dir",
-                str(tmp_path / "logs"),
-                "--output",
-                str(output),
+                "--run-id",
+                "test",
+                "--output-dir",
+                str(tmp_path / "swebench"),
             ]
         )
         == 0
@@ -122,6 +137,10 @@ def test_main_passes_only_selected_ids_to_official_grader(monkeypatch, tmp_path,
     assert [call[-2:] for call in grader_calls] == [
         ["--instance_ids", "repo__issue-2"],
         ["--instance_ids", "repo__issue-0"],
+    ]
+    assert all(kw["cwd"] == output.parent for kw in grader_kwargs)
+    assert [kw["trace_dir"] for kw in solve_kwargs] == [
+        output.parent / ".lhagent" / name for name in ("repo__issue-2", "repo__issue-0")
     ]
 
 
@@ -223,7 +242,7 @@ def test_failed_instances_are_not_submitted(monkeypatch, tmp_path, mock_summary)
     monkeypatch.setattr(adapter, "run_agent", lambda *_, **__: "patch")
     calls = []
     monkeypatch.setattr(subprocess, "run", lambda command, **_: calls.append(command))
-    output = tmp_path / "predictions.jsonl"
+    output = tmp_path / "swebench/test/predictions.jsonl"
     assert (
         adapter.main(
             [
@@ -231,10 +250,8 @@ def test_failed_instances_are_not_submitted(monkeypatch, tmp_path, mock_summary)
                 str(bundle),
                 "--config",
                 str(config),
-                "--output",
-                str(output),
-                "--log-dir",
-                str(tmp_path / "logs"),
+                "--output-dir",
+                str(tmp_path / "swebench"),
                 "--run-id",
                 "test",
             ]
@@ -243,7 +260,7 @@ def test_failed_instances_are_not_submitted(monkeypatch, tmp_path, mock_summary)
     )
     assert [json.loads(line)["instance_id"] for line in output.read_text().splitlines()] == ["good"]
     assert calls[0][-2:] == ["--instance_ids", "good"]
-    assert "bad" in json.loads((tmp_path / "logs/test.failures.json").read_text())
+    assert "bad" in json.loads((tmp_path / "swebench/test/logs/test.failures.json").read_text())
 
 
 @pytest.mark.parametrize("failure", [None, "solve", "grade", "cleanup"])
@@ -252,7 +269,7 @@ def test_task_lifecycle_order_and_failure_cleanup(monkeypatch, tmp_path, mock_su
     bundle.touch()
     config = tmp_path / "config.toml"
     config.write_text('[coding_agent]\ncwd = "/testbed"\n')
-    output = tmp_path / "predictions.jsonl"
+    output = tmp_path / "swebench/test/predictions.jsonl"
     tasks = [{"instance_id": name, "image": name} for name in ["first", "second"]]
     events = []
     monkeypatch.setattr(adapter, "discover_bundles", lambda _: {"linux/amd64": bundle})
@@ -291,10 +308,8 @@ def test_task_lifecycle_order_and_failure_cleanup(monkeypatch, tmp_path, mock_su
             str(bundle),
             "--config",
             str(config),
-            "--output",
-            str(output),
-            "--log-dir",
-            str(tmp_path / "logs"),
+            "--output-dir",
+            str(tmp_path / "swebench"),
             "--run-id",
             "test",
         ]
@@ -307,7 +322,7 @@ def test_task_lifecycle_order_and_failure_cleanup(monkeypatch, tmp_path, mock_su
         expected += [("solve", "second"), ("grade", "second"), ("cleanup", "second")]
     assert events == expected
     assert result == (1 if failure else 0)
-    errors = json.loads((tmp_path / "logs/test.failures.json").read_text())
+    errors = json.loads((tmp_path / "swebench/test/logs/test.failures.json").read_text())
     assert ("first" in errors) == bool(failure)
 
 
@@ -352,8 +367,9 @@ def test_grader_labels_only_created_containers(monkeypatch):
 
 
 def test_summary_aggregates_saved_reports_without_docker(monkeypatch, tmp_path):
-    monkeypatch.chdir(tmp_path)
-    predictions = tmp_path / "predictions.jsonl"
+    run_dir = tmp_path / "swebench/test"
+    run_dir.mkdir(parents=True)
+    predictions = run_dir / "predictions.jsonl"
     predictions.write_text(
         "\n".join(
             json.dumps(
@@ -367,13 +383,14 @@ def test_summary_aggregates_saved_reports_without_docker(monkeypatch, tmp_path):
         )
     )
     for name, resolved in [("first", True), ("second", False)]:
-        folder = tmp_path / "logs/evaluation/test/lhagent" / name
+        folder = run_dir / "logs/evaluation/test/lhagent" / name
         folder.mkdir(parents=True)
         (folder / "report.json").write_text(json.dumps({name: {"resolved": resolved}}))
     report_path = adapter.summarize_run(
         predictions, [{"instance_id": n} for n in ["first", "second", "failed"]], "test"
     )
     report = json.loads(report_path.read_text())
+    assert report_path == run_dir / "logs/evaluation/test/results.json"
     assert report["resolved_ids"] == ["first"]
     assert report["unresolved_ids"] == ["second"]
     assert report["incomplete_ids"] == ["failed"]
@@ -401,8 +418,12 @@ def test_agent_failure_removes_container(monkeypatch, tmp_path, timed_out):
             instruction="test",
             timeout=1,
             log_dir=tmp_path,
+            trace_dir=tmp_path / ".lhagent/failure",
             platform="linux/amd64",
             container_label="lhagent.swebench=test",
         )
+    assert calls[-2][0:2] == ["docker", "cp"]
+    assert calls[-2][2].endswith(":/tmp/.lhagent/.")
+    assert calls[-2][3] == str(tmp_path / ".lhagent/failure")
     assert calls[-1][:3] == ["docker", "rm", "-f"]
     assert "lhagent.swebench=test" in calls[0]
