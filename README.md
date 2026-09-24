@@ -1,75 +1,99 @@
 # LHAgent
 
-A terminal coding agent with streaming model responses, tools, and persistent sessions.
+> LHAgent 是一个面向学术研究的轻量级 AI 智能体运行框架（harness）。
 
-## Run
+## 📝 项目简介
 
-Configure the model and token budgets in `lhagent.toml` (see
-`lhagent.example.toml`). Set `LHAGENT_BASE_URL` and `LHAGENT_API_KEY` in the
-environment or in `.env` in the directory where you start the command.
-Environment variables take precedence over `.env`.
+许多开源 Agent harness 主要面向产品应用，功能丰富，但系统也相对复杂。对于学术研究来说，理解和修改这些系统往往需要投入较多精力，不便于快速建立实验基线。
+
+LHAgent 聚焦于 Agent harness 的基础能力，以轻量、直接的实现提供一个便于理解和修改的 baseline。研究者可以以此为起点开展方法研究和对比实验；刚接触 harness 的开发者也可以通过 LHAgent 熟悉其基本工作流程。
+
+## ✨ 核心功能
+
+- **轻量化 TUI**：在终端中与 Agent 快速交互，便于调试和观察运行过程。
+- **Benchmark 测评**：通过评测适配器运行基准任务并评估结果；目前提供 SWE-bench Lite 适配器，可按研究需要扩展其他 Benchmark。
+
+## 🛠️ 技术栈
+
+- **实现方式**：基于 Python 3.12 自行实现 harness，不依赖第三方 Agent 框架。
+- **智能体范式**：采用 ReAct 风格的模型—工具循环，由模型决定何时调用工具，并根据工具结果继续执行。
+- **内置工具**：`read`、`write`、`edit`（文件读写与修改），`ls`、`find`、`grep`（文件浏览与搜索），`bash`（执行命令）。
+- **主要依赖**：`openai` 用于访问兼容 OpenAI API 的模型服务，`prompt-toolkit` 用于终端交互，`jsonschema` 用于校验工具参数；另使用 `python-dotenv` 加载环境变量、`httpx` 处理网络相关错误与重试。
+
+## 🚀 快速开始
+
+### 环境要求
+
+- Python 3.12
+- [uv](https://docs.astral.sh/uv/)
+
+### 安装依赖
+
+在项目根目录运行：
+
+```sh
+uv sync
+```
+
+### 配置模型与 API 密钥
+
+```sh
+cp lhagent.example.toml lhagent.toml
+cp .example.env .env
+mkdir -p manual-workspace
+```
+
+在 `lhagent.toml` 中填写实际的模型名称、上下文窗口和最大输出 token 数；示例配置中的 `tools = []` 表示禁用工具，删除这一行即可启用全部内置工具。工作目录由 `cwd` 指定，使用其他路径时需先创建对应目录。
+
+在 `.env` 中填写模型服务的 `LHAGENT_BASE_URL` 和 `LHAGENT_API_KEY`。
+
+### 运行项目
 
 ```sh
 uv run lhagent --config lhagent.toml
-uv run lhagent --config lhagent.toml --instruction "Hello"
 ```
 
-Omitting `tools` enables all built-in tools; `tools = []` disables them.
-The configured `cwd` is a working directory, not a filesystem sandbox.
+该命令启动交互式终端界面。也可以使用 `uv run lhagent --config lhagent.toml --instruction "Hello"` 执行单条指令。
 
-For an offline Linux container bundle with a private Python runtime, see
-[packaging/README.md](packaging/README.md). Build with
-`./packaging/build.sh linux/amd64` (or `linux/arm64`); extracting the resulting
-archive is sufficient to run LHAgent without changing the task environment's PATH.
-The [SWE-bench Lite adapter](src/lhagent/evals/benchmarks/swebench/README.md)
-runs the bundle inside benchmark images and grades its patches with the official harness.
+## 📖 使用示例
 
-## Sessions And History
+以 SWE-bench Lite 为例，先准备评测配置 `swebench.toml`：填写实际模型参数，将 `[coding_agent]` 中的 `cwd` 设为 `/testbed`，并按需启用内置工具。评测还需要可用的 Docker、宿主环境中的 `LHAGENT_BASE_URL` 和 `LHAGENT_API_KEY` 环境变量。
 
-Every conversation is saved automatically as
-`.lhagent/sessions/<session-id>.jsonl` under the startup working directory
-(inside `LHAgent/` when launched from the project). The startup output shows its exact
-path; single-instruction mode prints the path to stderr so stdout remains the
-model answer. A new invocation starts a new session unless `--session` is given.
-
-In the terminal, `/session` shows the current path, `/history` redisplays its
-saved conversation, `/resume` selects an older conversation, and `/new` starts
-a new one. `/clear` only clears the display. `/help` lists all commands.
+在项目根目录运行以下命令，构建运行包并随机抽取 3 道任务进行测评：
 
 ```sh
-uv run lhagent --list-sessions
-uv run lhagent --history --session .lhagent/sessions/<session-id>.jsonl
-uv run lhagent --config lhagent.toml --session .lhagent/sessions/<session-id>.jsonl
+./packaging/build.sh
+uv run --with datasets --with swebench python -m lhagent.evals.benchmarks.swebench.adapter \
+  --bundle packaging/dist \
+  --config swebench.toml \
+  --count 3 --seed 42
 ```
 
-Listing and viewing history require neither model configuration nor API credentials.
-Older sessions under `~/.lhagent/sessions/` can still be opened with `--session`
-and their full path; changing the default does not move or delete existing files.
-The history viewer uses bounded previews for tool output; the JSONL file contains
-the complete stored results.
+## 🎯 项目亮点
 
-The JSONL log is the durable session trace: run starts and finishes, user messages,
-terminal model responses (including errors, reasoning, tool calls and usage),
-tool results, compaction summaries, and history exclusions. Records are appended
-and flushed during the run, including failed runs. Individual streaming deltas
-and raw HTTP requests are not stored. A process killed during streaming may
-leave an interrupted run without its unfinished response. Resuming or viewing
-a session validates the log and can recover an incomplete trailing record.
+- **轻量易改**：聚焦基础 harness 能力，便于作为研究 baseline 进行修改和扩展。
+- **交互与评测兼顾**：同一 Agent 可用于终端快速调试，也可接入 Benchmark 测评。
+- **过程可追踪**：通过配置文件控制运行参数，并保存会话记录，方便回看实验过程。
 
-## Tests
+## 📊 性能评估
 
-```sh
-uv run pytest -q
-uv run ruff check .
-uv run ruff format --check .
-```
+## 🔮 未来计划
 
-Tests use temporary working directories and fake credentials, independently of
-personal `.env` and `lhagent.toml` files. The model transport tests use mock HTTP.
-Development checks use pytest and Ruff; mypy is not required.
+- [ ] 完善终端交互和整体使用体验。
+- [ ] 持续开发并完善 harness 的核心功能。
+- [ ] 接入更多 Benchmark，开展更广泛的测评。
 
-## 0.51.0
+## 🤝 贡献指南
 
-Client tool definitions use the internal `name`, `description`, and `parameters`
-fields. Transport adds the OpenAI `type`/`function` wrapper; passing a prewrapped
-definition is no longer supported.
+欢迎提出Issue和Pull Request！
+
+## 📄 许可证
+
+本项目采用 [MIT License](LICENSE)。
+
+## 👤 作者
+
+- GitHub: [@kongweiduo](https://github.com/kongweiduo)
+- Email: victorkong355@gmail.com
+
+## 🙏 致谢
