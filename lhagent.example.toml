@@ -1,0 +1,24 @@
+# 可提交的示例；不是个人配置。复制到仓库外的专用测试目录后再修改。
+# model、context_window、max_output_tokens 必填；以下模型名是占位符，
+# 容量只是示意，真实调用前须按服务商文档替换，不保证适配所有服务商。
+# LHAGENT_BASE_URL、LHAGENT_API_KEY 从环境变量或启动目录的 .env 读取。
+[coding_agent]
+model = "your-model-id"
+context_window = 128000
+max_output_tokens = 4096
+# 相对路径以本 TOML 所在目录为基准。loader 不检查/创建目录，运行前需创建。
+# cwd 不是沙箱或路径访问白名单；不要指向主目录或含敏感数据的项目。
+cwd = "./manual-workspace"
+# 此示例显式禁用工具；省略 tools 则启用全部内置工具。按需替换为
+# ["read", "ls", "find", "grep"]；只读工具也可能向模型发送文件内容。
+# write/edit 可改写文件，bash 可执行任意命令并继承环境中的凭据；
+# 启用前确认风险。没有逐次权限审批或操作系统隔离保障。
+tools = []
+
+# 可选自动压缩配置。reserve_tokens >= max_output_tokens 且小于 context_window。
+# keep_recent_tokens 是近似保留目标，不保证压缩后一定适配窗口。
+# 自动压缩会调用模型生成摘要，可能产生额外费用。
+[coding_agent.compaction]
+enabled = true
+reserve_tokens = 8192
+keep_recent_tokens = 20000

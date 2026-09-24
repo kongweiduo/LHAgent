@@ -1,0 +1,26 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Logs & caches
+logs/
+.pytest_cache/
+.ruff_cache/
+
+# macOS
+.DS_Store
+
+lhagent.toml
+.lhagent/
+
+# Local credentials
+.env
+.env.*
+!.example.env
