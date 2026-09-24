@@ -69,6 +69,10 @@ uv run --with datasets --with swebench python -m lhagent.evals.benchmarks.sweben
   --count 3 --seed 42
 ```
 
+评测按题串行执行：做题 → 官方评分 → 保存结果 → 清理本轮容器和新增题目镜像。
+失败时也会清理，运行前已有镜像保留；清理失败则停止后续题目，防止磁盘继续累积。
+不支持断点续跑。详细行为见 [SWE-bench 说明](src/lhagent/evals/benchmarks/swebench/README.md)。
+
 ## 🎯 项目亮点
 
 - **轻量易改**：聚焦基础 harness 能力，便于作为研究 baseline 进行修改和扩展。

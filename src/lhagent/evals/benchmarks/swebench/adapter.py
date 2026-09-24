@@ -130,6 +130,7 @@ def run_agent(
     timeout: int,
     log_dir: Path,
     platform: str,
+    container_label: str = "lhagent.swebench=standalone",
 ) -> str:
     """Run LHAgent in one task image and return the resulting unified diff."""
     instance_id = instance["instance_id"]
@@ -153,6 +154,8 @@ def run_agent(
                 platform,
                 "--name",
                 name,
+                "--label",
+                container_label,
                 "-e",
                 "LHAGENT_API_KEY",
                 "-e",
@@ -214,6 +217,36 @@ def run_agent(
         subprocess.run(["docker", "rm", "-f", name], check=False, stdout=subprocess.DEVNULL)
 
 
+def cleanup_task(image: str, container_label: str, initial_images: set[str]) -> None:
+    """Remove this task's containers and only images absent before this run.
+
+    Never force image removal: an image used by another container must survive.
+    A cleanup error stops the run instead of accumulating more disk usage.
+    """
+    containers = _run(
+        ["docker", "ps", "-aq", "--filter", f"label={container_label}"], capture=True
+    ).split()
+    for container in containers:
+        _run(["docker", "rm", "-f", container])
+    image_ids = set(
+        _run(["docker", "image", "ls", "--no-trunc", "-q", image], capture=True).split()
+    )
+    if image_ids and not image_ids.intersection(initial_images):
+        _run(["docker", "image", "rm", image])
+
+
+def summarize_run(predictions_path: Path, selected: list[dict[str, Any]], run_id: str) -> Path:
+    """Aggregate persisted official reports without starting containers or pulling images."""
+    from swebench.harness.reporting import make_run_report
+
+    predictions = {
+        item["instance_id"]: item
+        for line in predictions_path.read_text().splitlines()
+        if (item := json.loads(line))
+    }
+    return make_run_report(predictions, selected, run_id)
+
+
 def _load_dataset(name: str) -> list[dict[str, Any]]:
     if name.endswith((".json", ".jsonl")):
         path = Path(name)
@@ -247,7 +280,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--output", type=Path, default=Path("predictions.jsonl"))
     parser.add_argument("--log-dir", type=Path, default=Path("logs/lhagent-swebench"))
-    parser.add_argument("--max-workers", type=int, default=1)
+    parser.add_argument(
+        "--max-workers",
+        type=int,
+        default=1,
+        help="grader worker limit (only one task is submitted at a time)",
+    )
     return parser
 
 
@@ -280,18 +318,26 @@ def main(argv: Sequence[str] | None = None) -> int:
     if missing_images:
         raise SystemExit("selected instances have no image: " + " ".join(missing_images))
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    failures = 0
+    initial_images = set(_run(["docker", "image", "ls", "--no-trunc", "-q"], capture=True).split())
+    run_id = args.run_id or "lhagent-" + uuid.uuid4().hex[:10]
+    # Independent of user-supplied run IDs, so concurrent runs cannot share labels.
+    container_label = "lhagent.swebench=" + uuid.uuid4().hex
+    args.log_dir.mkdir(parents=True, exist_ok=True)
+    plan_path = args.log_dir / f"{run_id}.platforms.json"
+    failures_path = args.log_dir / f"{run_id}.failures.json"
     plans = {}
     errors = {}
-    successful_ids = []
     with args.output.open("w", encoding="utf-8") as output:
         for number, instance in enumerate(selected, 1):
-            print(f"[{number}/{len(selected)}] {instance['instance_id']}", flush=True)
+            instance_id = instance["instance_id"]
+            image = _instance_image(instance)
+            print(f"[{number}/{len(selected)}] {instance_id}", flush=True)
+            cleanup_failed = False
             try:
-                image = _instance_image(instance)
                 if image not in plans:
                     plans[image] = select_platform(image_platforms(image), bundles, native)
                 platform = plans[image]
+                plan_path.write_text(json.dumps(plans, indent=2))
                 print(f"  {platform} -> {bundles[platform].name}", flush=True)
                 patch = run_agent(
                     instance,
@@ -301,59 +347,70 @@ def main(argv: Sequence[str] | None = None) -> int:
                     instruction=args.instruction,
                     timeout=args.timeout,
                     log_dir=args.log_dir,
+                    container_label=container_label,
                 )
-                successful_ids.append(instance["instance_id"])
+                output.write(
+                    json.dumps(
+                        {
+                            "instance_id": instance_id,
+                            "model_name_or_path": "lhagent",
+                            "model_patch": patch,
+                        }
+                    )
+                    + "\n"
+                )
+                # The grader opens this file in another process before the next task.
+                output.flush()
+                subprocess.run(
+                    [
+                        sys.executable,
+                        "-m",
+                        "lhagent.evals.benchmarks.swebench.grader",
+                        "--platform-plan",
+                        str(plan_path),
+                        "--container-label",
+                        container_label,
+                        "--dataset_name",
+                        args.dataset,
+                        "--split",
+                        "test",
+                        "--predictions_path",
+                        str(args.output),
+                        "--run_id",
+                        run_id,
+                        "--max_workers",
+                        str(args.max_workers),
+                        "--timeout",
+                        str(args.timeout),
+                        "--instance_ids",
+                        instance_id,
+                    ],
+                    check=True,
+                )
             except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-                failures += 1
-                errors[instance["instance_id"]] = str(exc)
-                args.log_dir.mkdir(parents=True, exist_ok=True)
-                (args.log_dir / f"{instance['instance_id']}.error.log").write_text(str(exc))
-                print(f"{instance['instance_id']}: {exc}", file=sys.stderr, flush=True)
-                continue
-            output.write(
-                json.dumps(
-                    {
-                        "instance_id": instance["instance_id"],
-                        "model_name_or_path": "lhagent",
-                        "model_patch": patch,
-                    }
-                )
-                + "\n"
-            )
-    run_id = args.run_id or "lhagent-" + uuid.uuid4().hex[:10]
-    args.log_dir.mkdir(parents=True, exist_ok=True)
-    (args.log_dir / f"{run_id}.failures.json").write_text(json.dumps(errors, indent=2))
-    plan_path = args.log_dir / f"{run_id}.platforms.json"
-    plan_path.write_text(json.dumps(plans, indent=2))
-    if not successful_ids:
-        print(f"No instances reached grading; {failures} failed. See {args.log_dir}")
-        return 1
-    subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "lhagent.evals.benchmarks.swebench.grader",
-            "--platform-plan",
-            str(plan_path),
-            "--dataset_name",
-            args.dataset,
-            "--split",
-            "test",
-            "--predictions_path",
-            str(args.output),
-            "--run_id",
-            run_id,
-            "--max_workers",
-            str(args.max_workers),
-            "--timeout",
-            str(args.timeout),
-            "--instance_ids",
-            *successful_ids,
-        ],
-        check=True,
-    )
-    print(f"SWE-bench report: logs/evaluation/{run_id}/results.json", flush=True)
-    return 1 if failures else 0
+                errors[instance_id] = str(exc)
+                (args.log_dir / f"{instance_id}.error.log").write_text(str(exc))
+                print(f"{instance_id}: {exc}", file=sys.stderr, flush=True)
+            finally:
+                try:
+                    cleanup_task(image, container_label, initial_images)
+                except (OSError, subprocess.SubprocessError) as exc:
+                    cleanup_failed = True
+                    message = f"Docker cleanup failed: {exc}"
+                    errors[instance_id] = errors.get(instance_id, "") + "\n" + message
+                    (args.log_dir / f"{instance_id}.error.log").write_text(errors[instance_id])
+                    print(message, file=sys.stderr, flush=True)
+                failures_path.write_text(json.dumps(errors, indent=2))
+            if cleanup_failed:
+                print("Stopping before the next task because Docker cleanup failed.", flush=True)
+                break
+    report_path = summarize_run(args.output, selected, run_id)
+    report = json.loads(report_path.read_text())
+    for instance_id in report.get("error_ids", []):
+        errors.setdefault(instance_id, "Official grading failed; see the evaluation logs")
+    failures_path.write_text(json.dumps(errors, indent=2))
+    print(f"SWE-bench report: {report_path}", flush=True)
+    return 1 if errors else 0
 
 
 if __name__ == "__main__":

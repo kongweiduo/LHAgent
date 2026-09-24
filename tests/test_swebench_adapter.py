@@ -67,7 +67,18 @@ def test_run_agent_captures_diff_without_agent_stdout(monkeypatch, tmp_path):
     assert any(command[:3] == ["docker", "rm", "-f"] for command in commands)
 
 
-def test_main_passes_only_selected_ids_to_official_grader(monkeypatch, tmp_path):
+@pytest.fixture
+def mock_summary(monkeypatch, tmp_path):
+    def summarize(*args):
+        path = tmp_path / "results.json"
+        path.write_text('{"error_ids": []}')
+        return path
+
+    monkeypatch.setattr(adapter, "summarize_run", summarize)
+    monkeypatch.setattr(adapter, "cleanup_task", lambda *args: None)
+
+
+def test_main_passes_only_selected_ids_to_official_grader(monkeypatch, tmp_path, mock_summary):
     bundle = tmp_path / "bundle.tar.gz"
     bundle.touch()
     config = tmp_path / "config.toml"
@@ -108,7 +119,10 @@ def test_main_passes_only_selected_ids_to_official_grader(monkeypatch, tmp_path)
     )
     predictions = [json.loads(line) for line in output.read_text().splitlines()]
     assert [item["instance_id"] for item in predictions] == ["repo__issue-2", "repo__issue-0"]
-    assert grader_calls[0][-3:] == ["--instance_ids", "repo__issue-2", "repo__issue-0"]
+    assert [call[-2:] for call in grader_calls] == [
+        ["--instance_ids", "repo__issue-2"],
+        ["--instance_ids", "repo__issue-0"],
+    ]
 
 
 @pytest.mark.parametrize(
@@ -186,7 +200,7 @@ def test_grader_uses_platform_for_each_image(monkeypatch):
     ]
 
 
-def test_failed_instances_are_not_submitted(monkeypatch, tmp_path):
+def test_failed_instances_are_not_submitted(monkeypatch, tmp_path, mock_summary):
     bundle = tmp_path / "bundle.tar.gz"
     bundle.touch()
     config = tmp_path / "config.toml"
@@ -230,3 +244,165 @@ def test_failed_instances_are_not_submitted(monkeypatch, tmp_path):
     assert [json.loads(line)["instance_id"] for line in output.read_text().splitlines()] == ["good"]
     assert calls[0][-2:] == ["--instance_ids", "good"]
     assert "bad" in json.loads((tmp_path / "logs/test.failures.json").read_text())
+
+
+@pytest.mark.parametrize("failure", [None, "solve", "grade", "cleanup"])
+def test_task_lifecycle_order_and_failure_cleanup(monkeypatch, tmp_path, mock_summary, failure):
+    bundle = tmp_path / "bundle.tar.gz"
+    bundle.touch()
+    config = tmp_path / "config.toml"
+    config.write_text('[coding_agent]\ncwd = "/testbed"\n')
+    output = tmp_path / "predictions.jsonl"
+    tasks = [{"instance_id": name, "image": name} for name in ["first", "second"]]
+    events = []
+    monkeypatch.setattr(adapter, "discover_bundles", lambda _: {"linux/amd64": bundle})
+    monkeypatch.setattr(adapter, "_load_dataset", lambda _: tasks)
+    monkeypatch.setattr(adapter, "_run", lambda *a, **kw: "")
+    monkeypatch.setattr(adapter, "image_platforms", lambda _: {"linux/amd64"})
+
+    def solve(instance, **kwargs):
+        name = instance["instance_id"]
+        events.append(("solve", name))
+        if failure == "solve" and name == "first":
+            raise RuntimeError("agent failed")
+        return "patch"
+
+    def grade(command, **kwargs):
+        name = command[-1]
+        events.append(("grade", name))
+        # Predictions must be on disk before the grader subprocess starts.
+        predictions = [json.loads(line) for line in output.read_text().splitlines()]
+        assert predictions[-1]["instance_id"] == name
+        assert "--container-label" in command
+        if failure == "grade" and name == "first":
+            raise subprocess.CalledProcessError(1, command)
+
+    def cleanup(image, label, initial):
+        events.append(("cleanup", image))
+        if failure == "cleanup":
+            raise subprocess.CalledProcessError(1, ["docker", "image", "rm", image])
+
+    monkeypatch.setattr(adapter, "run_agent", solve)
+    monkeypatch.setattr(adapter.subprocess, "run", grade)
+    monkeypatch.setattr(adapter, "cleanup_task", cleanup)
+    result = adapter.main(
+        [
+            "--bundle",
+            str(bundle),
+            "--config",
+            str(config),
+            "--output",
+            str(output),
+            "--log-dir",
+            str(tmp_path / "logs"),
+            "--run-id",
+            "test",
+        ]
+    )
+    expected = [("solve", "first")]
+    if failure != "solve":
+        expected.append(("grade", "first"))
+    expected.append(("cleanup", "first"))
+    if failure != "cleanup":
+        expected += [("solve", "second"), ("grade", "second"), ("cleanup", "second")]
+    assert events == expected
+    assert result == (1 if failure else 0)
+    errors = json.loads((tmp_path / "logs/test.failures.json").read_text())
+    assert ("first" in errors) == bool(failure)
+
+
+@pytest.mark.parametrize(
+    "image_ids,initial,removed",
+    [
+        ("sha256:new", {"sha256:old"}, True),
+        ("sha256:old", {"sha256:old"}, False),
+        ("", {"sha256:old"}, False),
+    ],
+)
+def test_cleanup_scopes_containers_and_preserves_existing_images(
+    monkeypatch, image_ids, initial, removed
+):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if command[1] == "ps":
+            return "owned-container\n"
+        if command[1:3] == ["image", "ls"]:
+            return image_ids
+        return ""
+
+    monkeypatch.setattr(adapter, "_run", run)
+    adapter.cleanup_task("task:latest", "lhagent.swebench=unique", initial)
+    assert calls[0] == ["docker", "ps", "-aq", "--filter", "label=lhagent.swebench=unique"]
+    assert calls[1] == ["docker", "rm", "-f", "owned-container"]
+    assert (["docker", "image", "rm", "task:latest"] in calls) == removed
+
+
+def test_grader_labels_only_created_containers(monkeypatch):
+    from docker.models.containers import ContainerCollection
+
+    from lhagent.evals.benchmarks.swebench.grader import docker_platforms
+
+    calls = []
+    monkeypatch.setattr(ContainerCollection, "create", lambda *a, **kw: calls.append(kw))
+    with docker_platforms({"image": "linux/amd64"}, "lhagent.swebench=unique"):
+        ContainerCollection.create(None, "image", labels={"existing": "value"})
+    assert calls[0]["labels"] == {"existing": "value", "lhagent.swebench": "unique"}
+
+
+def test_summary_aggregates_saved_reports_without_docker(monkeypatch, tmp_path):
+    monkeypatch.chdir(tmp_path)
+    predictions = tmp_path / "predictions.jsonl"
+    predictions.write_text(
+        "\n".join(
+            json.dumps(
+                {
+                    "instance_id": name,
+                    "model_name_or_path": "lhagent",
+                    "model_patch": "patch",
+                }
+            )
+            for name in ["first", "second"]
+        )
+    )
+    for name, resolved in [("first", True), ("second", False)]:
+        folder = tmp_path / "logs/evaluation/test/lhagent" / name
+        folder.mkdir(parents=True)
+        (folder / "report.json").write_text(json.dumps({name: {"resolved": resolved}}))
+    report_path = adapter.summarize_run(
+        predictions, [{"instance_id": n} for n in ["first", "second", "failed"]], "test"
+    )
+    report = json.loads(report_path.read_text())
+    assert report["resolved_ids"] == ["first"]
+    assert report["unresolved_ids"] == ["second"]
+    assert report["incomplete_ids"] == ["failed"]
+    assert report["total_instances"] == 3
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_agent_failure_removes_container(monkeypatch, tmp_path, timed_out):
+    calls = []
+
+    def run(command, **kwargs):
+        calls.append(command)
+        if command[:2] == ["docker", "exec"] and "--instruction" in command:
+            if timed_out:
+                raise subprocess.TimeoutExpired(command, 1)
+            return subprocess.CompletedProcess(command, 1, "partial output", "agent error")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(subprocess, "run", run)
+    with pytest.raises(subprocess.TimeoutExpired if timed_out else RuntimeError):
+        run_agent(
+            {"instance_id": "failure", "image": "task:latest"},
+            bundle=tmp_path / "bundle.tar.gz",
+            config=tmp_path / "config.toml",
+            instruction="test",
+            timeout=1,
+            log_dir=tmp_path,
+            platform="linux/amd64",
+            container_label="lhagent.swebench=test",
+        )
+    assert calls[-1][:3] == ["docker", "rm", "-f"]
+    assert "lhagent.swebench=test" in calls[0]

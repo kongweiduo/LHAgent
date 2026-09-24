@@ -1,3 +1,26 @@
+# 0.52.0 构建验证（2026-09-24）
+
+- 全量测试：`uv run --offline pytest -q --tb=short`，943 passed。
+- 此后新增两项 Agent 失败/超时容器清理测试；SWE-bench 专项最终为 27 passed。
+- Ruff check、format check、`uv lock --check --offline`、git diff check 均通过。
+- amd64、arm64 独立包构建成功，版本为 0.52.0，私有 CPython 3.12.14。
+- 两种架构均通过 `test.sh` 的 no-python、task-python 容器验证。
+- 已核对两个压缩包中的 adapter.py、grader.py 与工作区一致，SHA-256 校验通过。
+
+宿主为 macOS arm64 / Docker Desktop，amd64 使用仿真执行。容器测试覆盖非 root、
+只读根文件系统、禁网、自检、安装、路径迁移及任务 Python 环境隔离。
+SWE-bench 调度测试覆盖逐题评分后再清理、失败清理、已有镜像保护、清理失败停止，
+以及从已保存的官方逐题报告汇总；没有调用真实模型或运行完整 SWE-bench。
+
+产物位于 `packaging/dist/0.52.0/`（不纳入 Git），SHA-256：
+
+```text
+8056dbcddb9323cf041c725bbfcd494d707cc1a7cb2ffd5be9f8066fc1df477b  lhagent-0.52.0-linux-amd64.tar.gz
+84d2ccf5df118d43f6a8feb3fc16c5873fd85a8e8cdcb2cffc27462d626d13bb  lhagent-0.52.0-linux-arm64.tar.gz
+```
+
+复验命令见本目录 README.md。以下保留 0.51.0 的历史验证记录。
+
 # 2026-09-24 构建验证
 
 产物：LHAgent 0.51.0，私有 CPython 3.12.14，依赖取自 uv.lock。

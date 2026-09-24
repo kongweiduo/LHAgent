@@ -21,7 +21,7 @@ def _image_platform(image: str, platforms: dict[str, str]) -> str:
 
 
 @contextmanager
-def docker_platforms(platforms: dict[str, str]):
+def docker_platforms(platforms: dict[str, str], container_label: str | None = None):
     # The upstream harness uses the SDK, which ignores DOCKER_DEFAULT_PLATFORM.
     from docker.models.containers import ContainerCollection
     from docker.models.images import ImageCollection
@@ -31,6 +31,9 @@ def docker_platforms(platforms: dict[str, str]):
 
     def create(self, image, *args, **kwargs):
         kwargs["platform"] = _image_platform(image, platforms)
+        if container_label:
+            key, value = container_label.split("=", 1)
+            kwargs["labels"] = {**kwargs.get("labels", {}), key: value}
         return original_create(self, image, *args, **kwargs)
 
     def pull(self, repository, tag=None, *args, **kwargs):
@@ -48,10 +51,11 @@ def docker_platforms(platforms: dict[str, str]):
 def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--platform-plan", type=Path, required=True)
+    parser.add_argument("--container-label")
     args, remaining = parser.parse_known_args()
     platforms = json.loads(args.platform_plan.read_text())
     sys.argv = ["swebench.harness.run_evaluation", *remaining]
-    with docker_platforms(platforms):
+    with docker_platforms(platforms, args.container_label):
         runpy.run_module("swebench.harness.run_evaluation", run_name="__main__")
 
 
