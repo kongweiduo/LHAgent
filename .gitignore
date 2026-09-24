@@ -18,9 +18,17 @@ logs/
 .DS_Store
 
 lhagent.toml
+swebench.toml
 .lhagent/
 
 # Local credentials
 .env
 .env.*
 !.example.env
+
+# Packaging tools are local to the release Mac; publish only ready-to-use bundles.
+packaging/*
+!packaging/dist/
+packaging/dist/*
+!packaging/dist/*.tar.gz
+!packaging/dist/*.tar.gz.sha256

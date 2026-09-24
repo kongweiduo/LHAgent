@@ -1,18 +1,12 @@
 # SWE-bench Lite
 
-先构建两种 Linux 运行包（内含独立 Python，不是题目环境镜像）：
+`packaging/dist` 中提供两种 Linux 架构的运行包（内含独立 Python，不是题目环境镜像）。
+传入运行包目录即可：
 
 ```bash
-./packaging/build.sh linux/amd64
-./packaging/build.sh linux/arm64
-```
-
-只需传入产物目录：
-
-```bash
-python -m lhagent.evals.benchmarks.swebench.adapter \
+uv run --with datasets --with swebench python -m lhagent.evals.benchmarks.swebench.adapter \
   --bundle packaging/dist \
-  --config src/lhagent/evals/benchmarks/swebench/lhagent.toml \
+  --config swebench.toml \
   --count 3 --seed 42
 ```
 

@@ -22,12 +22,32 @@ LHAgent 聚焦于 Agent harness 的基础能力，以轻量、直接的实现提
 
 ## 🚀 快速开始
 
-### 环境要求
+### Linux 独立运行包
+
+不需要安装项目依赖时，可从 [`packaging/dist`](packaging/dist) 下载与机器架构匹配的
+`lhagent-0.53.0-linux-amd64.tar.gz` 或 `lhagent-0.53.0-linux-arm64.tar.gz`。
+运行包包含独立的 Python 3.12 和 LHAgent 依赖，适用于 glibc Linux；macOS 不能直接运行。
+下载同名 `.sha256` 文件后，在包所在目录校验并解压：
+
+```sh
+sha256sum -c lhagent-0.53.0-linux-amd64.tar.gz.sha256
+tar -xzf lhagent-0.53.0-linux-amd64.tar.gz
+./lhagent/lhagent --bundle-check
+./lhagent/lhagent --help
+```
+
+arm64 机器将命令中的 `amd64` 换成 `arm64`。`--bundle-check` 不调用模型。
+解压后可运行 `./lhagent/install.sh /absolute/path/to/bin` 创建命令软链接；
+安装后需保留解压目录。
+
+### 从源码运行
+
+#### 环境要求
 
 - Python 3.12
 - [uv](https://docs.astral.sh/uv/)
 
-### 安装依赖
+#### 安装依赖
 
 在项目根目录运行：
 
@@ -35,7 +55,7 @@ LHAgent 聚焦于 Agent harness 的基础能力，以轻量、直接的实现提
 uv sync
 ```
 
-### 配置模型与 API 密钥
+#### 配置模型与 API 密钥
 
 ```sh
 cp lhagent.example.toml lhagent.toml
@@ -47,7 +67,7 @@ mkdir -p manual-workspace
 
 在 `.env` 中填写模型服务的 `LHAGENT_BASE_URL` 和 `LHAGENT_API_KEY`。
 
-### 运行项目
+#### 运行项目
 
 ```sh
 uv run lhagent --config lhagent.toml
@@ -59,10 +79,9 @@ uv run lhagent --config lhagent.toml
 
 以 SWE-bench Lite 为例，先准备评测配置 `swebench.toml`：填写实际模型参数，将 `[coding_agent]` 中的 `cwd` 设为 `/testbed`，并按需启用内置工具。评测还需要可用的 Docker、宿主环境中的 `LHAGENT_BASE_URL` 和 `LHAGENT_API_KEY` 环境变量。
 
-在项目根目录运行以下命令，构建运行包并随机抽取 3 道任务进行测评：
+在项目根目录运行以下命令，使用已提供的运行包随机抽取 3 道任务进行测评：
 
 ```sh
-./packaging/build.sh
 uv run --with datasets --with swebench python -m lhagent.evals.benchmarks.swebench.adapter \
   --bundle packaging/dist \
   --config swebench.toml \
