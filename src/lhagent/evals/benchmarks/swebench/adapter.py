@@ -1,8 +1,7 @@
-"""Run LHAgent on SWE-bench Lite and delegate grading to SWE-bench.
+"""在 SWE-bench Lite 或 Verified 上运行 LHAgent，并调用官方评分器。
 
-The adapter deliberately uses the Docker CLI.  The benchmark images already
-contain the repository and test dependencies, while the LHAgent bundle is
-copied into each fresh container at runtime.
+适配器使用 Docker CLI：任务镜像已包含仓库和测试依赖，运行时将
+LHAgent 运行包复制到每个新建的容器中。
 """
 
 from __future__ import annotations
@@ -20,7 +19,14 @@ from contextlib import chdir
 from pathlib import Path
 from typing import Any
 
-DATASET = "SWE-bench/SWE-bench_Lite"
+DATASETS = {
+    "lite": "SWE-bench/SWE-bench_Lite",
+    "verified": "SWE-bench/SWE-bench_Verified",
+}
+DEFAULT_INSTRUCTION = (
+    "Implement the requested change in this repository. Read the issue below, "
+    "inspect the code and tests, make the fix, and verify it with focused tests.\n\n"
+)
 
 
 def select_instances(
@@ -30,10 +36,10 @@ def select_instances(
     instance_ids: Sequence[str] | None = None,
     seed: int | None = None,
 ) -> list[dict[str, Any]]:
-    """Select all, a reproducible random sample, or named instances.
+    """选择全部任务、可复现的随机样本或指定任务。
 
-    ``count`` and ``instance_ids`` are mutually exclusive.  The input order is
-    retained for named instances and randomized only for sampled instances.
+    ``count`` 与 ``instance_ids`` 互斥；指定任务按传入顺序返回，
+    仅随机抽样会打乱原始顺序。
     """
     if count is not None and instance_ids:
         raise ValueError("count and instance_ids cannot be combined")
@@ -77,7 +83,7 @@ def _instance_image(instance: dict[str, Any]) -> str:
 
 
 def discover_bundles(path: Path) -> dict[str, Path]:
-    """Identify bundles by their embedded TARGET, never their filename."""
+    """读取运行包内的 TARGET 标记，不依赖文件名判断平台。"""
     paths = sorted(path.glob("*.tar.gz")) if path.is_dir() else [path]
     bundles = {}
     for archive in paths:
@@ -97,7 +103,7 @@ def discover_bundles(path: Path) -> dict[str, Path]:
 
 
 def image_platforms(image: str) -> set[str]:
-    """Inspect registry manifests, falling back to a locally built image."""
+    """检查镜像清单；不可用时回退到本地镜像信息。"""
     try:
         data = json.loads(_run(["docker", "manifest", "inspect", "--verbose", image], capture=True))
     except subprocess.CalledProcessError:
@@ -135,18 +141,14 @@ def run_agent(
     platform: str,
     container_label: str = "lhagent.swebench=standalone",
 ) -> str:
-    """Run LHAgent in one task image and return the resulting unified diff."""
+    """在任务镜像中运行 LHAgent，返回统一格式的补丁。"""
     instance_id = instance["instance_id"]
     name = "lhagent-swe-" + instance_id.lower().replace("/", "-") + "-" + uuid.uuid4().hex[:8]
     image = _instance_image(instance)
     prompt = (
         instruction
         if instruction is not None
-        else (
-            "Implement the requested change in this repository. Read the issue below, "
-            "inspect the code and tests, make the fix, and verify it with focused tests.\n\n"
-            + str(instance.get("problem_statement", ""))
-        )
+        else DEFAULT_INSTRUCTION + str(instance.get("problem_statement", ""))
     )
     trace_ready = False
     try:
@@ -188,9 +190,8 @@ def run_agent(
                 "--noprofile",
                 "--norc",
                 "-c",
-                # Docker exec does not read the image's .bashrc. Activate the
-                # task environment before launching our isolated runtime so
-                # agent tools inherit the repository's Python and dependencies.
+                # Docker exec 不读取镜像的 .bashrc；先激活任务环境，
+                # 让 Agent 工具继承仓库的 Python 与依赖。
                 "if [ -f /opt/miniconda3/etc/profile.d/conda.sh ]; then "
                 "source /opt/miniconda3/etc/profile.d/conda.sh && "
                 'conda activate testbed || exit; fi; exec "$@"',
@@ -212,7 +213,7 @@ def run_agent(
             raise RuntimeError(
                 f"LHAgent exited {result.returncode}; see {log_dir / (instance_id + '.stderr.log')}"
             )
-        # Intent-to-add includes newly created files without changing their content.
+        # 使用 intent-to-add 纳入新文件，不修改其内容。
         _docker_exec(name, ["git", "add", "-N", "."], workdir="/testbed")
         return _docker_exec(
             name,
@@ -229,10 +230,10 @@ def run_agent(
 
 
 def cleanup_task(image: str, container_label: str, initial_images: set[str]) -> None:
-    """Remove this task's containers and only images absent before this run.
+    """清理本轮容器，以及运行前不存在的任务镜像。
 
-    Never force image removal: an image used by another container must survive.
-    A cleanup error stops the run instead of accumulating more disk usage.
+    不强制删除镜像，以免影响其他容器；清理失败则停止后续任务，
+    避免继续占用磁盘空间。
     """
     containers = _run(
         ["docker", "ps", "-aq", "--filter", f"label={container_label}"], capture=True
@@ -247,7 +248,7 @@ def cleanup_task(image: str, container_label: str, initial_images: set[str]) -> 
 
 
 def summarize_run(predictions_path: Path, selected: list[dict[str, Any]], run_id: str) -> Path:
-    """Aggregate persisted official reports without starting containers or pulling images."""
+    """汇总已保存的官方报告，不启动容器或拉取镜像。"""
     from swebench.harness.reporting import make_run_report
 
     predictions = {
@@ -271,7 +272,7 @@ def _load_dataset(name: str) -> list[dict[str, Any]]:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Run LHAgent on SWE-bench Lite")
+    parser = argparse.ArgumentParser(description="Run LHAgent on SWE-bench Lite or Verified")
     parser.add_argument(
         "--bundle",
         type=Path,
@@ -281,7 +282,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--config", type=Path, required=True, help="LHAgent config with cwd=/testbed"
     )
-    parser.add_argument("--dataset", default=DATASET)
+    parser.add_argument("--variant", choices=DATASETS, default="lite", help="SWE-bench variant")
+    parser.add_argument("--dataset", help="override the dataset selected by --variant")
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument("--count", type=int, help="randomly select N instances")
     mode.add_argument("--instance-ids", nargs="+", help="run these instance IDs")
@@ -302,6 +304,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    dataset_name = args.dataset or DATASETS[args.variant]
     if not args.bundle.exists() or not args.config.is_file():
         raise SystemExit("--bundle must be a file/directory and --config must be a file")
     if args.timeout < 1 or args.max_workers < 1:
@@ -316,7 +319,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         raise SystemExit(str(exc)) from exc
     arch = _run(["docker", "info", "--format", "{{.Architecture}}"], capture=True).strip()
     native = "linux/" + {"aarch64": "arm64", "x86_64": "amd64"}.get(arch, arch)
-    dataset = _load_dataset(args.dataset)
+    dataset = _load_dataset(dataset_name)
     selected = select_instances(
         dataset,
         count=args.count,
@@ -336,7 +339,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     output_path = run_dir / "predictions.jsonl"
     log_dir = run_dir / "logs"
     initial_images = set(_run(["docker", "image", "ls", "--no-trunc", "-q"], capture=True).split())
-    # Independent of user-supplied run IDs, so concurrent runs cannot share labels.
+    # 独立于用户指定的 run ID，避免并发运行复用容器标签。
     container_label = "lhagent.swebench=" + uuid.uuid4().hex
     log_dir.mkdir(parents=True, exist_ok=True)
     plan_path = log_dir / f"{run_id}.platforms.json"
@@ -376,7 +379,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                     )
                     + "\n"
                 )
-                # The grader opens this file in another process before the next task.
+                # 下一题开始前，评分器进程需要读取已写入的预测文件。
                 output.flush()
                 subprocess.run(
                     [
@@ -388,7 +391,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "--container-label",
                         container_label,
                         "--dataset_name",
-                        args.dataset,
+                        dataset_name,
                         "--split",
                         "test",
                         "--predictions_path",

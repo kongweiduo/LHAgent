@@ -11,7 +11,7 @@ LHAgent 聚焦于 Agent harness 的基础能力，以轻量、直接的实现提
 ## ✨ 核心功能
 
 - **轻量化 TUI**：在终端中与 Agent 快速交互，便于调试和观察运行过程。
-- **Benchmark 测评**：通过评测适配器运行基准任务并评估结果；目前提供 SWE-bench Lite 适配器，可按研究需要扩展其他 Benchmark。
+- **Benchmark 测评**：通过评测适配器运行基准任务并评估结果；目前支持 SWE-bench Lite 和 Verified，可按研究需要扩展其他 Benchmark。
 
 ## 🛠️ 技术栈
 
@@ -59,15 +59,16 @@ uv run lhagent --config lhagent.toml
 
 ## 📖 使用示例
 
-以 SWE-bench Lite 为例，先准备评测配置 `swebench.toml`：填写实际模型参数，将 `[coding_agent]` 中的 `cwd` 设为 `/testbed`，并按需启用内置工具。评测还需要可用的 Docker、宿主环境中的 `LHAGENT_BASE_URL` 和 `LHAGENT_API_KEY` 环境变量。
+评测 SWE-bench Lite 或 Verified 时，先准备配置 `swebench.toml`：填写实际模型参数，将 `[coding_agent]` 中的 `cwd` 设为 `/testbed`，并按需启用内置工具。评测还需要可用的 Docker、宿主环境中的 `LHAGENT_BASE_URL` 和 `LHAGENT_API_KEY` 环境变量。
 
-在项目根目录运行以下命令，使用已提供的运行包随机抽取 3 道任务进行测评：
+在项目根目录运行以下命令，使用已提供的运行包从 Verified 随机抽取 3 道任务进行测评：
 
 ```sh
 set -a; source .env; set +a
 uv run --with datasets --with swebench python -m lhagent.evals.benchmarks.swebench.adapter \
   --bundle packaging/dist \
   --config swebench.toml \
+  --variant verified \
   --count 3 --seed 42
 ```
 

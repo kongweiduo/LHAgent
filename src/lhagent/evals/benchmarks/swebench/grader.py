@@ -1,4 +1,4 @@
-"""Run the official grader with the same Docker platforms used for solving."""
+"""使用做题时选定的 Docker 平台运行官方评分器。"""
 
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ def _image_platform(image: str, platforms: dict[str, str]) -> str:
 
 @contextmanager
 def docker_platforms(platforms: dict[str, str], container_label: str | None = None):
-    # The upstream harness uses the SDK, which ignores DOCKER_DEFAULT_PLATFORM.
+    # 官方 harness 使用 Docker SDK，不读取 DOCKER_DEFAULT_PLATFORM。
     from docker.models.containers import ContainerCollection
     from docker.models.images import ImageCollection
 

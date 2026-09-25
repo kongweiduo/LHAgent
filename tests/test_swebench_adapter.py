@@ -85,7 +85,17 @@ def mock_summary(monkeypatch, tmp_path):
     monkeypatch.setattr(adapter, "cleanup_task", lambda *args: None)
 
 
-def test_main_passes_only_selected_ids_to_official_grader(monkeypatch, tmp_path, mock_summary):
+@pytest.mark.parametrize(
+    ("variant_args", "expected_dataset"),
+    [
+        ([], adapter.DATASETS["lite"]),
+        (["--variant", "verified"], adapter.DATASETS["verified"]),
+        (["--variant", "verified", "--dataset", "custom.jsonl"], "custom.jsonl"),
+    ],
+)
+def test_main_passes_only_selected_ids_to_official_grader(
+    monkeypatch, tmp_path, mock_summary, variant_args, expected_dataset
+):
     bundle = tmp_path / "bundle.tar.gz"
     bundle.touch()
     config = tmp_path / "config.toml"
@@ -94,7 +104,13 @@ def test_main_passes_only_selected_ids_to_official_grader(monkeypatch, tmp_path,
         {"instance_id": f"repo__issue-{number}", "image": f"swebench/x86_64.{number}"}
         for number in range(3)
     ]
-    monkeypatch.setattr(adapter, "_load_dataset", lambda _name: instances)
+    loaded_datasets = []
+
+    def load_dataset(name):
+        loaded_datasets.append(name)
+        return instances
+
+    monkeypatch.setattr(adapter, "_load_dataset", load_dataset)
     monkeypatch.setattr(adapter, "_run", lambda *_args, **_kwargs: "linux/amd64\n")
     monkeypatch.setattr(adapter, "image_platforms", lambda _: {"linux/amd64"})
     grader_calls = []
@@ -128,10 +144,13 @@ def test_main_passes_only_selected_ids_to_official_grader(monkeypatch, tmp_path,
                 "test",
                 "--output-dir",
                 str(tmp_path / "swebench"),
+                *variant_args,
             ]
         )
         == 0
     )
+    assert loaded_datasets == [expected_dataset]
+    assert all(call[call.index("--dataset_name") + 1] == expected_dataset for call in grader_calls)
     predictions = [json.loads(line) for line in output.read_text().splitlines()]
     assert [item["instance_id"] for item in predictions] == ["repo__issue-2", "repo__issue-0"]
     assert [call[-2:] for call in grader_calls] == [
