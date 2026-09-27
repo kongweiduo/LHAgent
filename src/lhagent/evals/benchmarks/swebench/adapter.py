@@ -260,6 +260,16 @@ def summarize_run(predictions_path: Path, selected: list[dict[str, Any]], run_id
         return Path(make_run_report(predictions, selected, run_id)).resolve()
 
 
+def _graded_report(run_dir: Path, run_id: str, instance_id: str) -> bool:
+    """Only a valid per-instance grade counts as a finished evaluation."""
+    path = run_dir / "logs" / "evaluation" / run_id / "lhagent" / instance_id / "report.json"
+    try:
+        result = json.loads(path.read_text())
+        return isinstance(result[instance_id]["resolved"], bool)
+    except (OSError, ValueError, KeyError, TypeError):
+        return False
+
+
 def _load_dataset(name: str) -> list[dict[str, Any]]:
     if name.endswith((".json", ".jsonl")):
         path = Path(name)
@@ -291,6 +301,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--instruction", help="override the generated issue prompt")
     parser.add_argument("--timeout", type=int, default=1800)
+    parser.add_argument(
+        "--retries", type=int, default=2, help="retries per failed task (default: 2)"
+    )
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--output-dir", type=Path, default=Path("swebench"))
     parser.add_argument(
@@ -307,8 +320,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     dataset_name = args.dataset or DATASETS[args.variant]
     if not args.bundle.exists() or not args.config.is_file():
         raise SystemExit("--bundle must be a file/directory and --config must be a file")
-    if args.timeout < 1 or args.max_workers < 1:
-        raise SystemExit("--timeout and --max-workers must be positive")
+    if args.timeout < 1 or args.max_workers < 1 or args.retries < 0:
+        raise SystemExit(
+            "--timeout and --max-workers must be positive; --retries must be nonnegative"
+        )
     with args.config.open("rb") as stream:
         config_data = tomllib.load(stream)
     if config_data.get("coding_agent", {}).get("cwd") != "/testbed":
@@ -352,76 +367,93 @@ def main(argv: Sequence[str] | None = None) -> int:
             image = _instance_image(instance)
             print(f"[{number}/{len(selected)}] {instance_id}", flush=True)
             cleanup_failed = False
-            try:
-                if image not in plans:
-                    plans[image] = select_platform(image_platforms(image), bundles, native)
-                platform = plans[image]
-                plan_path.write_text(json.dumps(plans, indent=2))
-                print(f"  {platform} -> {bundles[platform].name}", flush=True)
-                patch = run_agent(
-                    instance,
-                    bundle=bundles[platform],
-                    platform=platform,
-                    config=args.config,
-                    instruction=args.instruction,
-                    timeout=args.timeout,
-                    log_dir=log_dir,
-                    trace_dir=run_dir / ".lhagent" / instance_id,
-                    container_label=container_label,
-                )
-                output.write(
-                    json.dumps(
+            for attempt in range(1, args.retries + 2):
+                attempt_dir = log_dir / "attempts" / instance_id / str(attempt)
+                attempt_dir.mkdir(parents=True, exist_ok=True)
+                grade_dir = log_dir / "evaluation" / run_id / "lhagent" / instance_id
+                try:
+                    # SWE-bench skips an instance if report.json already exists.
+                    if attempt > 1 and grade_dir.exists():
+                        grade_dir.rename(
+                            log_dir / "attempts" / instance_id / str(attempt - 1) / "grade"
+                        )
+                    if image not in plans:
+                        plans[image] = select_platform(image_platforms(image), bundles, native)
+                    platform = plans[image]
+                    plan_path.write_text(json.dumps(plans, indent=2))
+                    print(
+                        f"  attempt {attempt}/{args.retries + 1}: {platform} -> {bundles[platform].name}",
+                        flush=True,
+                    )
+                    patch = run_agent(
+                        instance,
+                        bundle=bundles[platform],
+                        platform=platform,
+                        config=args.config,
+                        instruction=args.instruction,
+                        timeout=args.timeout,
+                        log_dir=attempt_dir,
+                        trace_dir=run_dir / ".lhagent" / instance_id / str(attempt),
+                        container_label=container_label,
+                    )
+                    prediction = json.dumps(
                         {
                             "instance_id": instance_id,
                             "model_name_or_path": "lhagent",
                             "model_patch": patch,
                         }
                     )
-                    + "\n"
-                )
-                # 下一题开始前，评分器进程需要读取已写入的预测文件。
-                output.flush()
-                subprocess.run(
-                    [
-                        sys.executable,
-                        "-m",
-                        "lhagent.evals.benchmarks.swebench.grader",
-                        "--platform-plan",
-                        str(plan_path),
-                        "--container-label",
-                        container_label,
-                        "--dataset_name",
-                        dataset_name,
-                        "--split",
-                        "test",
-                        "--predictions_path",
-                        str(output_path),
-                        "--run_id",
-                        run_id,
-                        "--max_workers",
-                        str(args.max_workers),
-                        "--timeout",
-                        str(args.timeout),
-                        "--instance_ids",
-                        instance_id,
-                    ],
-                    check=True,
-                    cwd=run_dir,
-                )
-            except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
-                errors[instance_id] = str(exc)
-                (log_dir / f"{instance_id}.error.log").write_text(str(exc))
-                print(f"{instance_id}: {exc}", file=sys.stderr, flush=True)
-            finally:
-                try:
-                    cleanup_task(image, container_label, initial_images)
-                except (OSError, subprocess.SubprocessError) as exc:
-                    cleanup_failed = True
-                    message = f"Docker cleanup failed: {exc}"
-                    errors[instance_id] = errors.get(instance_id, "") + "\n" + message
-                    (log_dir / f"{instance_id}.error.log").write_text(errors[instance_id])
-                    print(message, file=sys.stderr, flush=True)
-                failures_path.write_text(json.dumps(errors, indent=2))
+                    attempt_path = attempt_dir / "prediction.jsonl"
+                    attempt_path.write_text(prediction + "\n")
+                    subprocess.run(
+                        [
+                            sys.executable,
+                            "-m",
+                            "lhagent.evals.benchmarks.swebench.grader",
+                            "--platform-plan",
+                            str(plan_path),
+                            "--container-label",
+                            container_label,
+                            "--dataset_name",
+                            dataset_name,
+                            "--split",
+                            "test",
+                            "--predictions_path",
+                            str(attempt_path),
+                            "--run_id",
+                            run_id,
+                            "--max_workers",
+                            str(args.max_workers),
+                            "--timeout",
+                            str(args.timeout),
+                            "--instance_ids",
+                            instance_id,
+                        ],
+                        check=True,
+                        cwd=run_dir,
+                    )
+                    if not _graded_report(run_dir, run_id, instance_id):
+                        raise RuntimeError("Official grading did not produce a valid report")
+                    output.write(prediction + "\n")
+                    output.flush()
+                    errors.pop(instance_id, None)
+                    break
+                except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
+                    errors[instance_id] = str(exc)
+                    (attempt_dir / "error.log").write_text(str(exc))
+                    print(f"{instance_id} attempt {attempt}: {exc}", file=sys.stderr, flush=True)
+                finally:
+                    try:
+                        cleanup_task(image, container_label, initial_images)
+                    except (OSError, subprocess.SubprocessError) as exc:
+                        cleanup_failed = True
+                        message = f"Docker cleanup failed: {exc}"
+                        errors[instance_id] = errors.get(instance_id, "") + "\n" + message
+                        (attempt_dir / "error.log").write_text(errors[instance_id])
+                        print(message, file=sys.stderr, flush=True)
+                    failures_path.write_text(json.dumps(errors, indent=2))
+                if cleanup_failed:
+                    break
             if cleanup_failed:
                 print("Stopping before the next task because Docker cleanup failed.", flush=True)
                 break

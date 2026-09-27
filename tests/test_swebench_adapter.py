@@ -74,6 +74,12 @@ def test_run_agent_captures_diff_without_agent_stdout(monkeypatch, tmp_path):
     assert any(command[:3] == ["docker", "rm", "-f"] for command in commands)
 
 
+def write_grade(run_dir, name, resolved=True):
+    folder = run_dir / "logs/evaluation/test/lhagent" / name
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / "report.json").write_text(json.dumps({name: {"resolved": resolved}}))
+
+
 @pytest.fixture
 def mock_summary(monkeypatch, tmp_path):
     def summarize(*args):
@@ -126,6 +132,7 @@ def test_main_passes_only_selected_ids_to_official_grader(
     def fake_grader(command, **kwargs):
         grader_calls.append(command)
         grader_kwargs.append(kwargs)
+        write_grade(kwargs["cwd"], command[-1])
         return subprocess.CompletedProcess(command, 0)
 
     monkeypatch.setattr(adapter.subprocess, "run", fake_grader)
@@ -159,7 +166,7 @@ def test_main_passes_only_selected_ids_to_official_grader(
     ]
     assert all(kw["cwd"] == output.parent for kw in grader_kwargs)
     assert [kw["trace_dir"] for kw in solve_kwargs] == [
-        output.parent / ".lhagent" / name for name in ("repo__issue-2", "repo__issue-0")
+        output.parent / ".lhagent" / name / "1" for name in ("repo__issue-2", "repo__issue-0")
     ]
 
 
@@ -260,7 +267,12 @@ def test_failed_instances_are_not_submitted(monkeypatch, tmp_path, mock_summary)
     )
     monkeypatch.setattr(adapter, "run_agent", lambda *_, **__: "patch")
     calls = []
-    monkeypatch.setattr(subprocess, "run", lambda command, **_: calls.append(command))
+
+    def grade(command, **kwargs):
+        calls.append(command)
+        write_grade(kwargs["cwd"], command[-1])
+
+    monkeypatch.setattr(subprocess, "run", grade)
     output = tmp_path / "swebench/test/predictions.jsonl"
     assert (
         adapter.main(
@@ -288,7 +300,6 @@ def test_task_lifecycle_order_and_failure_cleanup(monkeypatch, tmp_path, mock_su
     bundle.touch()
     config = tmp_path / "config.toml"
     config.write_text('[coding_agent]\ncwd = "/testbed"\n')
-    output = tmp_path / "swebench/test/predictions.jsonl"
     tasks = [{"instance_id": name, "image": name} for name in ["first", "second"]]
     events = []
     monkeypatch.setattr(adapter, "discover_bundles", lambda _: {"linux/amd64": bundle})
@@ -306,12 +317,18 @@ def test_task_lifecycle_order_and_failure_cleanup(monkeypatch, tmp_path, mock_su
     def grade(command, **kwargs):
         name = command[-1]
         events.append(("grade", name))
-        # Predictions must be on disk before the grader subprocess starts.
-        predictions = [json.loads(line) for line in output.read_text().splitlines()]
+        # Each attempt has its own prediction file, written before grading.
+        predictions = [
+            json.loads(line)
+            for line in (kwargs["cwd"] / "logs/attempts" / name / "1/prediction.jsonl")
+            .read_text()
+            .splitlines()
+        ]
         assert predictions[-1]["instance_id"] == name
         assert "--container-label" in command
         if failure == "grade" and name == "first":
             raise subprocess.CalledProcessError(1, command)
+        write_grade(kwargs["cwd"], name)
 
     def cleanup(image, label, initial):
         events.append(("cleanup", image))
@@ -331,6 +348,8 @@ def test_task_lifecycle_order_and_failure_cleanup(monkeypatch, tmp_path, mock_su
             str(tmp_path / "swebench"),
             "--run-id",
             "test",
+            "--retries",
+            "0",
         ]
     )
     expected = [("solve", "first")]
@@ -414,6 +433,88 @@ def test_summary_aggregates_saved_reports_without_docker(monkeypatch, tmp_path):
     assert report["unresolved_ids"] == ["second"]
     assert report["incomplete_ids"] == ["failed"]
     assert report["total_instances"] == 3
+
+
+def test_retry_summary_counts_only_successful_grades(monkeypatch, tmp_path):
+    bundle = tmp_path / "bundle.tar.gz"
+    bundle.touch()
+    config = tmp_path / "config.toml"
+    config.write_text('[coding_agent]\ncwd = "/testbed"\n')
+    names = ["recovered", "unresolved", "exhausted", "missing"]
+    monkeypatch.setattr(adapter, "discover_bundles", lambda _: {"linux/amd64": bundle})
+    monkeypatch.setattr(
+        adapter, "_load_dataset", lambda _: [{"instance_id": name, "image": name} for name in names]
+    )
+    monkeypatch.setattr(adapter, "_run", lambda *a, **kw: "")
+    monkeypatch.setattr(adapter, "image_platforms", lambda _: {"linux/amd64"})
+    monkeypatch.setattr(adapter, "cleanup_task", lambda *a: None)
+    attempts = {name: 0 for name in names}
+
+    def solve(instance, **kwargs):
+        name = instance["instance_id"]
+        attempts[name] += 1
+        if name == "exhausted":
+            raise RuntimeError("agent failed")
+        return "patch"
+
+    def grade(command, **kwargs):
+        name = command[-1]
+        prediction = json.loads(
+            (
+                kwargs["cwd"] / "logs/attempts" / name / str(attempts[name]) / "prediction.jsonl"
+            ).read_text()
+        )
+        assert prediction["instance_id"] == name
+        if name == "recovered" and attempts[name] == 1:
+            folder = kwargs["cwd"] / "logs/evaluation/test/lhagent" / name
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "report.json").write_text("invalid json")
+            return
+        if name == "missing":
+            return  # successful process but no report
+        write_grade(kwargs["cwd"], name, resolved=name == "recovered")
+
+    monkeypatch.setattr(adapter, "run_agent", solve)
+    monkeypatch.setattr(adapter.subprocess, "run", grade)
+    assert (
+        adapter.main(
+            [
+                "--bundle",
+                str(bundle),
+                "--config",
+                str(config),
+                "--output-dir",
+                str(tmp_path),
+                "--run-id",
+                "test",
+            ]
+        )
+        == 1
+    )
+    run_dir = tmp_path / "test"
+    report = json.loads((run_dir / "logs/evaluation/test/results.json").read_text())
+    assert report["resolved_ids"] == ["recovered"]
+    assert report["unresolved_ids"] == ["unresolved"]
+    assert report["incomplete_ids"] == ["exhausted", "missing"]
+    assert report["total_instances"] == 4
+    assert attempts == {"recovered": 2, "unresolved": 1, "exhausted": 3, "missing": 3}
+    predictions = [
+        json.loads(line) for line in (run_dir / "predictions.jsonl").read_text().splitlines()
+    ]
+    assert [item["instance_id"] for item in predictions] == ["recovered", "unresolved"]
+    assert (run_dir / "logs/attempts/recovered/1/grade/report.json").exists()
+    failures = json.loads((run_dir / "logs/test.failures.json").read_text())
+    assert set(failures) == {"exhausted", "missing"}
+
+
+@pytest.mark.parametrize("retries", ["-1", "oops"])
+def test_invalid_retry_count(retries, tmp_path):
+    bundle = tmp_path / "bundle.tar.gz"
+    bundle.touch()
+    config = tmp_path / "config.toml"
+    config.write_text('[coding_agent]\ncwd = "/testbed"\n')
+    with pytest.raises(SystemExit):
+        adapter.main(["--bundle", str(bundle), "--config", str(config), "--retries", retries])
 
 
 @pytest.mark.parametrize("timed_out", [False, True])
