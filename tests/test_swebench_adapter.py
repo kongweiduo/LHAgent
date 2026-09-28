@@ -8,6 +8,8 @@ import pytest
 from lhagent.evals.benchmarks.swebench import adapter
 from lhagent.evals.benchmarks.swebench.adapter import run_agent, select_instances
 
+GRADE_LOG_DIR = adapter.RUN_EVALUATION_LOG_DIR
+
 
 @pytest.fixture
 def instances():
@@ -75,7 +77,7 @@ def test_run_agent_captures_diff_without_agent_stdout(monkeypatch, tmp_path):
 
 
 def write_grade(run_dir, name, resolved=True):
-    folder = run_dir / "logs/evaluation/test/lhagent" / name
+    folder = run_dir / GRADE_LOG_DIR / "test/lhagent" / name
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "report.json").write_text(json.dumps({name: {"resolved": resolved}}))
 
@@ -421,14 +423,14 @@ def test_summary_aggregates_saved_reports_without_docker(monkeypatch, tmp_path):
         )
     )
     for name, resolved in [("first", True), ("second", False)]:
-        folder = run_dir / "logs/evaluation/test/lhagent" / name
+        folder = run_dir / GRADE_LOG_DIR / "test/lhagent" / name
         folder.mkdir(parents=True)
         (folder / "report.json").write_text(json.dumps({name: {"resolved": resolved}}))
     report_path = adapter.summarize_run(
         predictions, [{"instance_id": n} for n in ["first", "second", "failed"]], "test"
     )
     report = json.loads(report_path.read_text())
-    assert report_path == run_dir / "logs/evaluation/test/results.json"
+    assert report_path == run_dir / GRADE_LOG_DIR / "test/results.json"
     assert report["resolved_ids"] == ["first"]
     assert report["unresolved_ids"] == ["second"]
     assert report["incomplete_ids"] == ["failed"]
@@ -466,7 +468,7 @@ def test_retry_summary_counts_only_successful_grades(monkeypatch, tmp_path):
         )
         assert prediction["instance_id"] == name
         if name == "recovered" and attempts[name] == 1:
-            folder = kwargs["cwd"] / "logs/evaluation/test/lhagent" / name
+            folder = kwargs["cwd"] / GRADE_LOG_DIR / "test/lhagent" / name
             folder.mkdir(parents=True, exist_ok=True)
             (folder / "report.json").write_text("invalid json")
             return
@@ -492,7 +494,7 @@ def test_retry_summary_counts_only_successful_grades(monkeypatch, tmp_path):
         == 1
     )
     run_dir = tmp_path / "test"
-    report = json.loads((run_dir / "logs/evaluation/test/results.json").read_text())
+    report = json.loads((run_dir / GRADE_LOG_DIR / "test/results.json").read_text())
     assert report["resolved_ids"] == ["recovered"]
     assert report["unresolved_ids"] == ["unresolved"]
     assert report["incomplete_ids"] == ["exhausted", "missing"]
@@ -505,6 +507,59 @@ def test_retry_summary_counts_only_successful_grades(monkeypatch, tmp_path):
     assert (run_dir / "logs/attempts/recovered/1/grade/report.json").exists()
     failures = json.loads((run_dir / "logs/test.failures.json").read_text())
     assert set(failures) == {"exhausted", "missing"}
+
+
+def test_server_report_directory_accepts_first_grade(monkeypatch, tmp_path, mock_summary):
+    bundle = tmp_path / "bundle.tar.gz"
+    bundle.touch()
+    config = tmp_path / "config.toml"
+    config.write_text('[coding_agent]\ncwd = "/testbed"\n')
+    monkeypatch.setattr(adapter, "RUN_EVALUATION_LOG_DIR", adapter.Path("logs/run_evaluation"))
+    monkeypatch.setattr(adapter, "discover_bundles", lambda _: {"linux/amd64": bundle})
+    monkeypatch.setattr(adapter, "_load_dataset", lambda _: [{"instance_id": "issue", "image": "image"}])
+    monkeypatch.setattr(adapter, "_run", lambda *a, **kw: "linux/amd64")
+    monkeypatch.setattr(adapter, "image_platforms", lambda _: {"linux/amd64"})
+    attempts = []
+
+    def solve(*args, **kwargs):
+        attempts.append("solve")
+        return "patch"
+
+    def grade(command, **kwargs):
+        attempts.append("grade")
+        folder = kwargs["cwd"] / "logs/run_evaluation/test/lhagent/issue"
+        folder.mkdir(parents=True)
+        (folder / "report.json").write_text('{"issue": {"resolved": true}}')
+
+    monkeypatch.setattr(adapter, "run_agent", solve)
+    monkeypatch.setattr(adapter.subprocess, "run", grade)
+    assert adapter.main([
+        "--bundle", str(bundle), "--config", str(config), "--output-dir", str(tmp_path),
+        "--run-id", "test",
+    ]) == 0
+    assert attempts == ["solve", "grade"]
+    assert json.loads((tmp_path / "test/predictions.jsonl").read_text())["instance_id"] == "issue"
+
+
+def test_no_successful_grades_skips_summary(monkeypatch, tmp_path, mock_summary, capsys):
+    bundle = tmp_path / "bundle.tar.gz"
+    bundle.touch()
+    config = tmp_path / "config.toml"
+    config.write_text('[coding_agent]\ncwd = "/testbed"\n')
+    monkeypatch.setattr(adapter, "discover_bundles", lambda _: {"linux/amd64": bundle})
+    monkeypatch.setattr(adapter, "_load_dataset", lambda _: [{"instance_id": "issue", "image": "image"}])
+    monkeypatch.setattr(adapter, "_run", lambda *a, **kw: "linux/amd64")
+    monkeypatch.setattr(adapter, "image_platforms", lambda _: {"linux/amd64"})
+    monkeypatch.setattr(adapter, "run_agent", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("agent failed")))
+    monkeypatch.setattr(adapter, "summarize_run", lambda *a: pytest.fail("empty summary called"))
+    assert adapter.main([
+        "--bundle", str(bundle), "--config", str(config), "--output-dir", str(tmp_path),
+        "--run-id", "test", "--retries", "0",
+    ]) == 1
+    assert "No successfully graded predictions" in capsys.readouterr().err
+    assert json.loads((tmp_path / "test/logs/test.failures.json").read_text()) == {
+        "issue": "agent failed"
+    }
 
 
 @pytest.mark.parametrize("retries", ["-1", "oops"])

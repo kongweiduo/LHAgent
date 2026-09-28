@@ -19,6 +19,8 @@ from contextlib import chdir
 from pathlib import Path
 from typing import Any
 
+from swebench.harness.constants import RUN_EVALUATION_LOG_DIR
+
 DATASETS = {
     "lite": "SWE-bench/SWE-bench_Lite",
     "verified": "SWE-bench/SWE-bench_Verified",
@@ -262,12 +264,16 @@ def summarize_run(predictions_path: Path, selected: list[dict[str, Any]], run_id
 
 def _graded_report(run_dir: Path, run_id: str, instance_id: str) -> bool:
     """Only a valid per-instance grade counts as a finished evaluation."""
-    path = run_dir / "logs" / "evaluation" / run_id / "lhagent" / instance_id / "report.json"
+    path = _grade_dir(run_dir, run_id, instance_id) / "report.json"
     try:
         result = json.loads(path.read_text())
         return isinstance(result[instance_id]["resolved"], bool)
     except (OSError, ValueError, KeyError, TypeError):
         return False
+
+
+def _grade_dir(run_dir: Path, run_id: str, instance_id: str) -> Path:
+    return run_dir / RUN_EVALUATION_LOG_DIR / run_id / "lhagent" / instance_id
 
 
 def _load_dataset(name: str) -> list[dict[str, Any]]:
@@ -370,7 +376,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             for attempt in range(1, args.retries + 2):
                 attempt_dir = log_dir / "attempts" / instance_id / str(attempt)
                 attempt_dir.mkdir(parents=True, exist_ok=True)
-                grade_dir = log_dir / "evaluation" / run_id / "lhagent" / instance_id
+                grade_dir = _grade_dir(run_dir, run_id, instance_id)
                 try:
                     # SWE-bench skips an instance if report.json already exists.
                     if attempt > 1 and grade_dir.exists():
@@ -457,6 +463,9 @@ def main(argv: Sequence[str] | None = None) -> int:
             if cleanup_failed:
                 print("Stopping before the next task because Docker cleanup failed.", flush=True)
                 break
+    if not output_path.stat().st_size:
+        print(f"No successfully graded predictions; see {failures_path}", file=sys.stderr)
+        return 1
     report_path = summarize_run(output_path, selected, run_id)
     report = json.loads(report_path.read_text())
     for instance_id in report.get("error_ids", []):
