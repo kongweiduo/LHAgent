@@ -368,11 +368,11 @@ def test_real_sdk_response_is_closed_on_cancellation(monkeypatch):
     run(scenario())
 
 
-def test_no_retry_after_acquiring_response(monkeypatch):
-    """取得响应后发生错误不得重新发送请求。"""
+def test_stream_retry_can_be_disabled(monkeypatch):
+    """显式禁用客户端重试时，取得响应后的错误直接返回。"""
 
     async def scenario():
-        c = client(monkeypatch)
+        c = client(monkeypatch, max_retries=0)
         response = Response(failure=httpx.ReadError("secret"))
         c._transport.responses["one"] = response
         result = await c.complete(request())

@@ -98,65 +98,82 @@ class Client:
         """驱动流并交付唯一终结结果；增量等待消费确认，异常按固定文案脱敏。"""
         call_id = request["call_id"]
         metrics = CallMetrics()
-        accumulator = _Accumulator()
-        finish_reason = None
         error_kind = None
         error_message = None
-        response = None
+        finish_reason = None
+        accumulator = _Accumulator()
         try:
-            try:
-                if cancel_event is not None and cancel_event.is_set():
-                    raise _CallCancelled
-                response = await self._establish(request, state, cancel_event, metrics)
-                async with aclosing(response):
-                    response_iterator = response.__aiter__()
-                    while True:
-                        chunk = await self._read_chunk(response_iterator, state, cancel_event)
-                        if chunk is None:
-                            break
-                        if chunk["usage"] is not None:
-                            metrics.update_usage(chunk["usage"])
-                        if finish_reason is not None and chunk["deltas"]:
-                            raise ProtocolError("content after finish_reason")
-                        for delta in chunk["deltas"]:
-                            index = accumulator.append(delta)
-                            if any(delta["data"].values()):
-                                metrics.record_first_content()
-                            acknowledged.clear()
-                            events.put_nowait(
-                                {
-                                    "call_id": call_id,
-                                    "type": "delta",
-                                    "block_index": index,
-                                    "data": {"type": delta["type"], **delta["data"]},
-                                    "result": None,
-                                }
-                            )
-                            await _await_cancellable(
-                                acknowledged.wait(), state.cancel_event, cancel_event
-                            )
-                        reason = chunk["finish_reason"]
-                        if reason is not None:
-                            if finish_reason is not None or reason not in _FINISH_REASONS:
-                                raise ProtocolError("invalid or repeated finish_reason")
-                            finish_reason = _FINISH_REASONS[reason]
-                if state.cancel_event.is_set() or (
-                    cancel_event is not None and cancel_event.is_set()
-                ):
-                    raise _CallCancelled
-                if finish_reason is None:
-                    raise ProtocolError("stream ended without a valid finish_reason")
-                accumulator.finish(finish_reason)
-            except _CallCancelled:
-                finish_reason = "cancelled"
-                error_kind = error_message = None
-            except Exception as error:
-                error_kind = classify_error(error)
-                error_message = _ERROR_MESSAGES[error_kind]
-                detail = error_detail(error, self._config.api_key)
-                if detail:
-                    error_message += " " + detail
-                finish_reason = "error"
+            attempts = 0
+            while True:
+                attempts += 1
+                accumulator = _Accumulator()
+                finish_reason = None
+                pending_deltas = []
+                response_acquired = False
+                try:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise _CallCancelled
+                    response = await self._establish(request, state, cancel_event, metrics)
+                    response_acquired = True
+                    async with aclosing(response):
+                        response_iterator = response.__aiter__()
+                        while True:
+                            chunk = await self._read_chunk(response_iterator, state, cancel_event)
+                            if chunk is None:
+                                break
+                            if chunk["usage"] is not None:
+                                metrics.update_usage(chunk["usage"])
+                            if finish_reason is not None and chunk["deltas"]:
+                                raise ProtocolError("content after finish_reason")
+                            for delta in chunk["deltas"]:
+                                index = accumulator.append(delta)
+                                if any(delta["data"].values()):
+                                    metrics.record_first_content()
+                                pending_deltas.append(
+                                    {
+                                        "call_id": call_id,
+                                        "type": "delta",
+                                        "block_index": index,
+                                        "data": {"type": delta["type"], **delta["data"]},
+                                        "result": None,
+                                    }
+                                )
+                            reason = chunk["finish_reason"]
+                            if reason is not None:
+                                if finish_reason is not None or reason not in _FINISH_REASONS:
+                                    raise ProtocolError("invalid or repeated finish_reason")
+                                finish_reason = _FINISH_REASONS[reason]
+                    if state.cancel_event.is_set() or (
+                        cancel_event is not None and cancel_event.is_set()
+                    ):
+                        raise _CallCancelled
+                    if finish_reason is None:
+                        raise ProtocolError("stream ended without a valid finish_reason")
+                    accumulator.finish(finish_reason)
+                    for event in pending_deltas:
+                        acknowledged.clear()
+                        events.put_nowait(event)
+                        await _await_cancellable(
+                            acknowledged.wait(), state.cancel_event, cancel_event
+                        )
+                    break
+                except _CallCancelled:
+                    finish_reason = "cancelled"
+                    error_kind = error_message = None
+                    break
+                except Exception as error:
+                    if response_acquired and should_retry(error, attempts, self._config):
+                        delay = get_retry_delay(error, attempts - 1, self._config)
+                        if delay is not None:
+                            await _wait_cancel(delay, state.cancel_event, cancel_event)
+                            continue
+                    error_kind = classify_error(error)
+                    error_message = _ERROR_MESSAGES[error_kind]
+                    detail = error_detail(error, self._config.api_key)
+                    if detail:
+                        error_message += " " + detail
+                    finish_reason = "error"
+                    break
             result: ClientResult = {
                 "call_id": call_id,
                 "content": accumulator.content,

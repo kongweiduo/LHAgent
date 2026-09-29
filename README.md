@@ -73,8 +73,8 @@ uv run --with datasets --with swebench python -m lhagent.evals.benchmarks.sweben
 ```
 
 评测按题串行执行：做题 → 官方评分 → 保存结果 → 清理本轮容器和新增题目镜像。
-做题或评分失败时默认重试 2 次（`--retries 0` 可禁用）；有效评分为未解决的题目不会重试。
-所有题目结束后统一生成 summary：重试成功的题目按最终评分计入，耗尽重试仍未完成评分的题目计为 incomplete。
+每道题只运行一次；任务级失败不会重新创建容器重跑。模型连接或流式传输失败由客户端在同一上下文下自动重试，默认最多 3 次。
+所有题目结束后统一生成 summary；未完成评分的题目计为 incomplete。
 失败时也会清理，运行前已有镜像保留；清理失败则停止后续题目，防止磁盘继续累积。
 不支持断点续跑。每次运行的最终预测、评分报告和各次尝试的日志保存在 `swebench/<run_id>/`，
 每题的原始会话 JSONL 保存在 `swebench/<run_id>/.lhagent/<task_id>/<attempt>/sessions/`，

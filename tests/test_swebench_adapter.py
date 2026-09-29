@@ -350,12 +350,10 @@ def test_task_lifecycle_order_and_failure_cleanup(monkeypatch, tmp_path, mock_su
             str(tmp_path / "swebench"),
             "--run-id",
             "test",
-            "--retries",
-            "0",
         ]
     )
     expected = [("solve", "first")]
-    if failure != "solve":
+    if failure not in ("solve",):
         expected.append(("grade", "first"))
     expected.append(("cleanup", "first"))
     if failure != "cleanup":
@@ -437,7 +435,7 @@ def test_summary_aggregates_saved_reports_without_docker(monkeypatch, tmp_path):
     assert report["total_instances"] == 3
 
 
-def test_retry_summary_counts_only_successful_grades(monkeypatch, tmp_path):
+def test_single_attempt_summary_records_failed_tasks(monkeypatch, tmp_path):
     bundle = tmp_path / "bundle.tar.gz"
     bundle.touch()
     config = tmp_path / "config.toml"
@@ -467,7 +465,7 @@ def test_retry_summary_counts_only_successful_grades(monkeypatch, tmp_path):
             ).read_text()
         )
         assert prediction["instance_id"] == name
-        if name == "recovered" and attempts[name] == 1:
+        if name == "recovered":
             folder = kwargs["cwd"] / GRADE_LOG_DIR / "test/lhagent" / name
             folder.mkdir(parents=True, exist_ok=True)
             (folder / "report.json").write_text("invalid json")
@@ -495,18 +493,17 @@ def test_retry_summary_counts_only_successful_grades(monkeypatch, tmp_path):
     )
     run_dir = tmp_path / "test"
     report = json.loads((run_dir / GRADE_LOG_DIR / "test/results.json").read_text())
-    assert report["resolved_ids"] == ["recovered"]
+    assert report["resolved_ids"] == []
     assert report["unresolved_ids"] == ["unresolved"]
-    assert report["incomplete_ids"] == ["exhausted", "missing"]
+    assert report["incomplete_ids"] == ["exhausted", "missing", "recovered"]
     assert report["total_instances"] == 4
-    assert attempts == {"recovered": 2, "unresolved": 1, "exhausted": 3, "missing": 3}
+    assert attempts == {name: 1 for name in names}
     predictions = [
         json.loads(line) for line in (run_dir / "predictions.jsonl").read_text().splitlines()
     ]
-    assert [item["instance_id"] for item in predictions] == ["recovered", "unresolved"]
-    assert (run_dir / "logs/attempts/recovered/1/grade/report.json").exists()
+    assert [item["instance_id"] for item in predictions] == ["unresolved"]
     failures = json.loads((run_dir / "logs/test.failures.json").read_text())
-    assert set(failures) == {"exhausted", "missing"}
+    assert set(failures) == {"recovered", "exhausted", "missing"}
 
 
 def test_server_report_directory_accepts_first_grade(monkeypatch, tmp_path, mock_summary):
@@ -554,7 +551,7 @@ def test_no_successful_grades_skips_summary(monkeypatch, tmp_path, mock_summary,
     monkeypatch.setattr(adapter, "summarize_run", lambda *a: pytest.fail("empty summary called"))
     assert adapter.main([
         "--bundle", str(bundle), "--config", str(config), "--output-dir", str(tmp_path),
-        "--run-id", "test", "--retries", "0",
+            "--run-id", "test",
     ]) == 1
     assert "No successfully graded predictions" in capsys.readouterr().err
     assert json.loads((tmp_path / "test/logs/test.failures.json").read_text()) == {

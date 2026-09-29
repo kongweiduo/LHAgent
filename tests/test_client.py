@@ -2,6 +2,8 @@
 
 import asyncio
 
+import httpx
+
 from lhagent.client.client import Client
 from lhagent.client.config import load_config
 
@@ -122,6 +124,58 @@ def test_complete_reports_interrupted_stream_as_error(monkeypatch):
         assert result["finish_reason"] == "error"
         assert result["error_kind"] == "protocol"
         assert result["content"] == [{"type": "text", "text": "partial"}]
+        await client.close()
+
+    asyncio.run(run())
+
+
+def test_stream_transport_failure_retries_whole_response(monkeypatch):
+    """流中途连接失败时重发同一请求，并只交付成功尝试的增量。"""
+
+    class RetryTransport:
+        def __init__(self, config):
+            self.opened = 0
+
+        async def open_stream(self, request):
+            self.opened += 1
+            attempt = self.opened
+
+            async def chunks():
+                if attempt == 1:
+                    yield {
+                        "deltas": [{"type": "text", "tool_index": None, "data": {"text": "old"}}],
+                        "usage": None,
+                        "finish_reason": None,
+                    }
+                    raise httpx.ReadError("connection dropped")
+                yield {
+                    "deltas": [{"type": "text", "tool_index": None, "data": {"text": "new"}}],
+                    "usage": None,
+                    "finish_reason": "stop",
+                }
+
+            return _Closable(chunks())
+
+        async def close(self):
+            pass
+
+    monkeypatch.setattr("lhagent.client.client.Transport", RetryTransport)
+
+    async def run():
+        client = Client(
+            load_config(
+                {
+                    "base_url": "https://example.test",
+                    "api_key": "x",
+                    "max_retry_delay_seconds": 0,
+                }
+            )
+        )
+        events = [event async for event in client.stream(request())]
+        assert [event["data"]["text"] for event in events[:-1]] == ["new"]
+        assert events[-1]["result"]["finish_reason"] == "stop"
+        assert events[-1]["result"]["stats"]["attempts"] == 2
+        assert client._transport.opened == 2
         await client.close()
 
     asyncio.run(run())
