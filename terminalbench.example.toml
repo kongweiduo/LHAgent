@@ -1,0 +1,14 @@
+# Copy to terminalbench.toml. API credentials come from the host .env.
+[coding_agent]
+model = "deepseek-v4.1-flash"
+context_window = 256000
+max_output_tokens = 8192
+# Omit cwd to follow each official task environment's WORKDIR automatically.
+# Set an absolute container path only when intentionally overriding it.
+# cwd = "/app"
+# tools = ["read", "ls", "find", "grep", "write", "edit", "bash"]
+
+[coding_agent.compaction]
+enabled = true
+reserve_tokens = 10240
+keep_recent_tokens = 20480

@@ -12,6 +12,7 @@ wheels/
 # Logs & caches
 logs/
 /swebench/
+/terminalbench/
 .pytest_cache/
 .ruff_cache/
 
@@ -20,6 +21,7 @@ logs/
 
 lhagent.toml
 swebench.toml
+terminalbench.toml
 .lhagent/
 
 # Local credentials
