@@ -178,11 +178,14 @@ def _request_body(request: ClientRequest) -> dict[str, object]:
             raise TypeError("tools must be a list")
         # 内部工具描述不绑定协议，在发送边界补上兼容接口要求的包装。
         body["tools"] = [_tool_body(tool) for tool in tools]
+    # max_output_tokens 不再映射为 max_completion_tokens，因为后者限制了
+    # 整个输出（包括 reasoning_content），而我们只希望限制最终的 text content。
+    # 客户端会在流式处理时监控 text content 的长度并主动停止。
     if "max_output_tokens" in body:
         limit = body.pop("max_output_tokens")
         if type(limit) is not int or limit <= 0:
             raise ValueError("max_output_tokens must be a positive integer")
-        body["max_completion_tokens"] = limit
+        # 不设置 max_completion_tokens，让 API 不限制总输出（reasoning 可以任意长）
     if not isinstance(request["model"], str) or not request["model"]:
         raise ValueError("model must be a nonempty string")
     body.update(

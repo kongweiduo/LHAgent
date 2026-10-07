@@ -102,6 +102,8 @@ class Client:
         error_message = None
         finish_reason = None
         accumulator = _Accumulator()
+        # 提取 max_output_tokens 用于客户端侧限制（仅限制 text content，不限制 reasoning）
+        max_output_tokens = request.get("parameters", {}).get("max_output_tokens")
         try:
             attempts = 0
             while True:
@@ -110,6 +112,7 @@ class Client:
                 finish_reason = None
                 pending_deltas = []
                 response_acquired = False
+                text_content_length = 0  # 累积 text content 的字符数
                 try:
                     if cancel_event is not None and cancel_event.is_set():
                         raise _CallCancelled
@@ -129,6 +132,17 @@ class Client:
                                 index = accumulator.append(delta)
                                 if any(delta["data"].values()):
                                     metrics.record_first_content()
+                                # 监控 text content 的长度（不包括 reasoning）
+                                if delta["type"] == "text" and "text" in delta["data"]:
+                                    text = delta["data"]["text"]
+                                    text_content_length += len(text)
+                                    # 估算 token 数：中文字符约 2 tokens，英文单词约 0.75 tokens
+                                    # 使用保守估算：字符数 / 2（假设混合内容）
+                                    estimated_tokens = text_content_length / 2
+                                    if max_output_tokens and estimated_tokens > max_output_tokens:
+                                        finish_reason = "length"
+                                        # 不再读取更多 chunks，直接跳出
+                                        break
                                 pending_deltas.append(
                                     {
                                         "call_id": call_id,
@@ -143,6 +157,9 @@ class Client:
                                 if finish_reason is not None or reason not in _FINISH_REASONS:
                                     raise ProtocolError("invalid or repeated finish_reason")
                                 finish_reason = _FINISH_REASONS[reason]
+                            # 如果我们客户端侧设置了 finish_reason，跳出读取循环
+                            if finish_reason == "length":
+                                break
                     if state.cancel_event.is_set() or (
                         cancel_event is not None and cancel_event.is_set()
                     ):
