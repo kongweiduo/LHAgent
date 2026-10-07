@@ -29,7 +29,7 @@ from harbor.registry.client.package import PackageDatasetClient
 from harbor.trial.trial import Trial
 
 from .agent import discover_bundles
-from .environment import cleanup_images, docker
+from .environment import ResourceUnavailableError, cleanup_images, docker
 
 DATASET = "terminal-bench/terminal-bench"
 DATASET_VERSION = "4.0.0"
@@ -173,6 +173,48 @@ def validate_prebuilt_task(task):
             raise ValueError("task has no official prebuilt verifier image; local builds disabled")
 
 
+class TaskSkipped(Exception):
+    """The task cannot run on this Docker host; it is reported apart from failures."""
+
+
+async def host_resources() -> dict:
+    """Read what the Docker host can offer; GPUs are None when present but uncountable."""
+    info = json.loads(await docker("info", "--format", "{{json .}}"))
+    gpus = 0
+    if shutil.which("nvidia-smi"):
+        process = await asyncio.create_subprocess_exec(
+            "nvidia-smi", "-L", stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL
+        )
+        stdout, _ = await process.communicate()
+        if process.returncode == 0:
+            gpus = sum(1 for line in stdout.decode().splitlines() if line.startswith("GPU "))
+    if not gpus and "nvidia" in (info.get("Runtimes") or {}):
+        gpus = None
+    return {
+        "cpus": info.get("NCPU"),
+        # Kernel and VM reservations make an "8 GB" host report slightly less; round up to GiB.
+        "memory_mb": math.ceil((info.get("MemTotal") or 0) / 1024**3) * 1024 or None,
+        "gpus": gpus,
+    }
+
+
+def resource_shortfalls(task, host) -> list[str]:
+    """Compare every environment the task starts (agent and verifiers) with the host."""
+    environments = [("environment", task.config.environment)]
+    for step in task.config.steps or [None]:
+        definition = resolve_verifier_environment_definition(task.config, task.paths, step)
+        if definition is not None:
+            label = "verifier" if step is None else f"verifier[{step.name}]"
+            environments.append((label, definition.config))
+    shortfalls = []
+    for label, config in environments:
+        for key, unit in (("cpus", " CPUs"), ("memory_mb", " MB memory"), ("gpus", " GPUs")):
+            needed, available = getattr(config, key) or 0, host.get(key)
+            if available is not None and needed > available:
+                shortfalls.append(f"{label} needs {needed}{unit}, host has {available}")
+    return shortfalls
+
+
 def graded_reward(result) -> float:
     if result.exception_info is not None:
         raise RuntimeError(result.exception_info.exception_message)
@@ -183,7 +225,7 @@ def graded_reward(result) -> float:
     return float(value)
 
 
-async def run_trial(task, *, args, run_dir, bundles, initial_images, native):
+async def run_trial(task, *, args, run_dir, bundles, initial_images, native, host):
     name = task_id(task)
     attempt_dir = run_dir / "logs/attempts" / name / "1"
     attempt_dir.mkdir(parents=True, exist_ok=True)
@@ -191,7 +233,7 @@ async def run_trial(task, *, args, run_dir, bundles, initial_images, native):
     agent_config = AgentConfig(
         import_path="lhagent.evals.benchmarks.terminalbench.agent:LHAgent",
         model_name=tomllib.loads(args.config.read_text())["coding_agent"].get("model"),
-        override_timeout_sec=None if args.official_timeouts else args.timeout + 60,
+        override_timeout_sec=None if args.timeout is None else args.timeout + 60,
         kwargs={
             "bundles": {key: str(path) for key, path in bundles.items()},
             "config": str(args.config.resolve()),
@@ -218,19 +260,26 @@ async def run_trial(task, *, args, run_dir, bundles, initial_images, native):
                 "native_platform": native,
             },
         ),
-        verifier=VerifierConfig(
-            override_timeout_sec=None if args.official_timeouts else args.test_timeout
-        ),
+        verifier=VerifierConfig(override_timeout_sec=args.test_timeout),
     )
     trial = await Trial.create(config)
     try:
         validate_prebuilt_task(trial.task)
-        if args.official_timeouts:
+        shortfalls = resource_shortfalls(trial.task, host)
+        if shortfalls:
+            raise TaskSkipped("; ".join(shortfalls))
+        if args.timeout is None:
             trial.agent.timeout = trial.agent_timeout_sec
         result = await trial.run()
         report_dir = run_dir / "logs/run_evaluation" / args.run_id / "lhagent" / name
         report_dir.mkdir(parents=True, exist_ok=True)
         (report_dir / "report.json").write_text(result.model_dump_json(indent=2))
+        infos = [result.exception_info] + [
+            step.exception_info for step in result.step_results or []
+        ]
+        for info in infos:
+            if info is not None and info.exception_type == ResourceUnavailableError.__name__:
+                raise TaskSkipped(info.exception_message)
         return result
     finally:
         try:
@@ -246,7 +295,10 @@ async def run_trial(task, *, args, run_dir, bundles, initial_images, native):
             trial._close_logger_handler()
 
 
-def summarize_run(run_dir, selected, run_id, results, errors, *, dataset, timeout_profile):
+def summarize_run(
+    run_dir, selected, run_id, results, errors, *, dataset, timeout_profile, skipped=None
+):
+    skipped = skipped or {}
     resolved, unresolved = [], []
     for name, result in results.items():
         try:
@@ -261,9 +313,14 @@ def summarize_run(run_dir, selected, run_id, results, errors, *, dataset, timeou
         "total_instances": len(selected),
         "resolved_ids": sorted(resolved),
         "unresolved_ids": sorted(unresolved),
-        "incomplete_ids": sorted({task_id(task) for task in selected} - completed),
+        "incomplete_ids": sorted({task_id(task) for task in selected} - completed - skipped.keys()),
         "error_ids": sorted(errors),
+        "skipped_ids": sorted(skipped),
+        "skipped_reasons": dict(sorted(skipped.items())),
         "accuracy": len(resolved) / len(selected),
+        "accuracy_on_runnable": (
+            len(resolved) / runnable if (runnable := len(selected) - len(skipped)) else None
+        ),
     }
     report_path = run_dir / "logs/run_evaluation" / run_id / "results.json"
     report_path.parent.mkdir(parents=True, exist_ok=True)
@@ -289,13 +346,15 @@ async def evaluate(args, bundles):
     initial_images = set((await docker("image", "ls", "--no-trunc", "-q")).split())
     arch = (await docker("info", "--format", "{{.Architecture}}")).strip()
     native = "linux/" + {"aarch64": "arm64", "x86_64": "amd64"}.get(arch, arch)
+    host = await host_resources()
     run_dir = (args.output_dir / args.run_id).resolve()
     run_dir.mkdir(parents=True, exist_ok=False)
     (run_dir / "logs").mkdir()
+    # None means the task's own task.toml limit applies.
     profile = {
-        "mode": "official" if args.official_timeouts else "swebench",
-        "agent_timeout_sec": None if args.official_timeouts else args.timeout,
-        "verifier_timeout_sec": None if args.official_timeouts else args.test_timeout,
+        "mode": "official" if args.timeout is None and args.test_timeout is None else "custom",
+        "agent_timeout_sec": args.timeout,
+        "verifier_timeout_sec": args.test_timeout,
     }
     dataset = (
         str(args.dataset_path.resolve())
@@ -312,12 +371,13 @@ async def evaluate(args, bundles):
                 "n_attempts": 1,
                 "n_concurrent_trials": 1,
                 "timeout_profile": profile,
+                "host_resources": host,
             },
             indent=2,
         )
     )
     failures_path = run_dir / "logs" / f"{args.run_id}.failures.json"
-    errors, results = {}, {}
+    errors, results, skipped = {}, {}, {}
     with (run_dir / "predictions.jsonl").open("w") as output:
         for number, task in enumerate(selected, 1):
             name = task_id(task)
@@ -332,6 +392,7 @@ async def evaluate(args, bundles):
                     bundles=bundles,
                     initial_images=initial_images,
                     native=native,
+                    host=host,
                 )
                 results[name] = result
                 reward = graded_reward(result)
@@ -346,6 +407,10 @@ async def evaluate(args, bundles):
                 (attempt_dir / "prediction.jsonl").write_text(prediction + "\n")
                 output.write(prediction + "\n")
                 output.flush()
+            except TaskSkipped as exc:
+                skipped[name] = str(exc)
+                (attempt_dir / "skipped.log").write_text(str(exc))
+                print(f"{name}: skipped ({exc})", flush=True)
             except Exception as exc:
                 errors[name] = str(exc)
                 (attempt_dir / "error.log").write_text(str(exc))
@@ -363,7 +428,14 @@ async def evaluate(args, bundles):
                 print("Stopping before the next task because Docker cleanup failed.", flush=True)
                 break
     report = summarize_run(
-        run_dir, selected, args.run_id, results, errors, dataset=dataset, timeout_profile=profile
+        run_dir,
+        selected,
+        args.run_id,
+        results,
+        errors,
+        dataset=dataset,
+        timeout_profile=profile,
+        skipped=skipped,
     )
     print(f"Terminal-Bench 4.0 report: {report}", flush=True)
     return int(bool(errors))
@@ -382,12 +454,18 @@ def build_parser():
     mode.add_argument("--all", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--instruction")
-    parser.add_argument("--timeout", type=int, default=1800)
-    parser.add_argument("--test-timeout", type=int, default=1800)
+    parser.add_argument(
+        "--timeout", type=int, help="agent timeout in seconds (default: each task's official limit)"
+    )
+    parser.add_argument(
+        "--test-timeout",
+        type=int,
+        help="verifier timeout in seconds (default: each task's official limit)",
+    )
     parser.add_argument(
         "--official-timeouts",
         action="store_true",
-        help="use official task timeouts instead of SWE's 1800-second defaults",
+        help="deprecated: official task timeouts are now the default",
     )
     parser.add_argument("--run-id")
     parser.add_argument("--output-dir", type=Path, default=Path("terminalbench"))
@@ -396,7 +474,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    if args.timeout < 1 or args.test_timeout < 1:
+    if any(value is not None and value < 1 for value in (args.timeout, args.test_timeout)):
         raise SystemExit("timeouts must be positive")
     if not args.config.is_file():
         raise SystemExit("--config must be a file")

@@ -1,6 +1,6 @@
 [project]
 name = "lhagent"
-version = "1.2.0"
+version = "1.2.1"
 description = "A coding agent with persistent sessions and tool execution"
 readme = "README.md"
 authors = [

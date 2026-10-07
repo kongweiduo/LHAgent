@@ -9,6 +9,27 @@ from pathlib import Path
 from harbor.environments.docker.docker import DockerEnvironment
 
 
+class ResourceUnavailableError(RuntimeError):
+    """The Docker host cannot provide the CPUs, memory or GPUs a task requests."""
+
+
+# Docker/Compose messages emitted when a container's resource request cannot be satisfied.
+RESOURCE_ERROR_PATTERNS = (
+    "range of cpus",
+    "cannot be greater than the number of cpus",
+    "could not select device driver",
+    "nvidia-container-cli",
+    "unknown or invalid runtime name: nvidia",
+    "insufficient memory",
+    "minimum memory limit",
+)
+
+
+def is_resource_error(message: str) -> bool:
+    message = message.lower()
+    return any(pattern in message for pattern in RESOURCE_ERROR_PATTERNS)
+
+
 async def docker(*args: str) -> str:
     process = await asyncio.create_subprocess_exec(
         "docker", *args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
@@ -104,6 +125,14 @@ class PrebuiltDockerEnvironment(DockerEnvironment):
                     raise ValueError("every task service must use a prebuilt image")
                 self.task_images.add(service["image"])
             command = ["up", "--no-build", *command[1:]]
+            try:
+                return await super()._run_docker_compose_command(command, **kwargs)
+            except RuntimeError as exc:
+                if is_resource_error(str(exc)):
+                    raise ResourceUnavailableError(
+                        f"Docker host cannot satisfy task resources: {exc}"
+                    ) from exc
+                raise
         return await super()._run_docker_compose_command(command, **kwargs)
 
     async def stop(self, delete=True):

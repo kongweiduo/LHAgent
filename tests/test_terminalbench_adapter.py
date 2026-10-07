@@ -45,7 +45,7 @@ def test_bundle_target_is_read_from_archive(tmp_path):
 def test_defaults_and_selection():
     args = adapter.build_parser().parse_args(["--bundle", "bundles", "--config", "config.toml"])
     assert (args.dataset, args.dataset_version) == ("terminal-bench/terminal-bench", "4.0.0")
-    assert args.timeout == args.test_timeout == 1800
+    assert args.timeout is None and args.test_timeout is None
     tasks = [TaskConfig(path=Path(name)) for name in ["c", "a", "b"]]
     assert adapter.select_tasks(tasks, count=2, seed=42) == adapter.select_tasks(
         tasks[::-1], count=2, seed=42
@@ -136,7 +136,12 @@ def test_agent_saves_trajectory_on_success_and_failure(tmp_path, monkeypatch, st
     assert "--kill-after=10" in call.args[0]
 
 
-def make_task(root, *, agent_image="official:agent", verifier_image="official:verifier"):
+HOST = {"cpus": 2, "memory_mb": 7900, "gpus": 0}
+
+
+def make_task(
+    root, *, agent_image="official:agent", verifier_image="official:verifier", env="", verifier=""
+):
     root.mkdir()
     (root / "environment").mkdir()
     (root / "tests").mkdir()
@@ -145,8 +150,10 @@ def make_task(root, *, agent_image="official:agent", verifier_image="official:ve
     (root / "task.toml").write_text(
         'schema_version = "1.0"\n[agent]\ntimeout_sec = 28800\n[environment]\n'
         + (f'docker_image = "{agent_image}"\n' if agent_image else "")
+        + env
         + '[verifier]\nenvironment_mode = "separate"\n[verifier.environment]\n'
         + (f'docker_image = "{verifier_image}"\n' if verifier_image else "")
+        + verifier
     )
     return Task(root)
 
@@ -225,13 +232,14 @@ def test_serial_run_directories_summary_and_failures(tmp_path, monkeypatch, fail
     tasks = [TaskConfig(path=tmp_path / name) for name in ["first", "second"]]
     monkeypatch.setattr(adapter, "load_tasks", AsyncMock(return_value=(tasks, {})))
     monkeypatch.setattr(adapter, "docker", AsyncMock(return_value="aarch64"))
+    monkeypatch.setattr(adapter, "host_resources", AsyncMock(return_value=HOST))
     events = []
 
     async def trial(task, **kwargs):
         name = adapter.task_id(task)
         events.extend([(name, "solve"), (name, "grade"), (name, "cleanup")])
         run_dir = kwargs["run_dir"]
-        assert kwargs["args"].timeout == 1800
+        assert kwargs["args"].timeout is None
         if name == "first":
             if failure == "solve":
                 raise RuntimeError("solve failed")
@@ -278,16 +286,14 @@ def test_invalid_grades_are_incomplete(reward):
         adapter.graded_reward(grade("task", reward))
 
 
-@pytest.mark.parametrize("official_timeouts", [False, True])
-def test_real_harbor_trial_saves_outputs_before_image_cleanup(
-    tmp_path, monkeypatch, official_timeouts
-):
+@pytest.mark.parametrize("timeout", [None, 1800])
+def test_real_harbor_trial_saves_outputs_before_image_cleanup(tmp_path, monkeypatch, timeout):
     task = make_task(tmp_path / "task")
     config = tmp_path / "config.toml"
     config.write_text('[coding_agent]\nmodel = "test-model"\n')
     args = adapter.build_parser().parse_args(["--bundle", str(tmp_path), "--config", str(config)])
     args.run_id = "test"
-    args.official_timeouts = official_timeouts
+    args.timeout = timeout
     events = []
 
     async def start(self, force_build=False):
@@ -301,7 +307,7 @@ def test_real_harbor_trial_saves_outputs_before_image_cleanup(
         return SimpleNamespace(return_code=0, stdout="", stderr="")
 
     async def solve(self, instruction, environment, context):
-        assert self.timeout == (task.config.agent.timeout_sec if official_timeouts else 1800)
+        assert self.timeout == (timeout or task.config.agent.timeout_sec)
         events.append((environment.task_env_config.docker_image, "solve"))
         native = self.logs_dir / "native/sessions"
         native.mkdir(parents=True)
@@ -347,6 +353,7 @@ def test_real_harbor_trial_saves_outputs_before_image_cleanup(
             bundles={"linux/amd64": tmp_path / "bundle"},
             initial_images=set(),
             native="linux/amd64",
+            host=HOST,
         )
     )
     assert result.exception_info is None
@@ -423,3 +430,133 @@ def test_compose_requires_prebuilt_images_for_every_service(monkeypatch):
         run(instance._run_docker_compose_command(["up", "-d"]))
     with pytest.raises(RuntimeError, match="builds are disabled"):
         run(instance._run_docker_compose_command(["build"]))
+
+
+def test_resource_shortfalls_cover_agent_and_verifier_environments(tmp_path):
+    fits = make_task(tmp_path / "fits", env="cpus = 2\nmemory_mb = 4096\ngpus = 0\n")
+    assert adapter.resource_shortfalls(fits, HOST) == []
+    gpu = make_task(tmp_path / "gpu", env="cpus = 8\ngpus = 1\n", verifier="memory_mb = 16384\n")
+    assert adapter.resource_shortfalls(gpu, HOST) == [
+        "environment needs 8 CPUs, host has 2",
+        "environment needs 1 GPUs, host has 0",
+        "verifier needs 16384 MB memory, host has 7900",
+    ]
+    # An nvidia runtime without a countable GPU list must not cause a skip.
+    assert (
+        adapter.resource_shortfalls(gpu, {**HOST, "cpus": 8, "memory_mb": None, "gpus": None}) == []
+    )
+
+
+@pytest.mark.parametrize(
+    "smi,runtimes,expected",
+    [(None, {}, 0), ("GPU 0: A\nGPU 1: B\n", {}, 2), (None, {"nvidia": {}}, None)],
+)
+def test_host_resources_reads_docker_info(monkeypatch, smi, runtimes, expected):
+    info = {"NCPU": 2, "MemTotal": 7_900 * 1024**2, "Runtimes": {"runc": {}, **runtimes}}
+    monkeypatch.setattr(adapter, "docker", AsyncMock(return_value=json.dumps(info)))
+    monkeypatch.setattr(adapter.shutil, "which", lambda name: smi and "/usr/bin/nvidia-smi")
+    process = SimpleNamespace(
+        returncode=0, communicate=AsyncMock(return_value=((smi or "").encode(), b""))
+    )
+    monkeypatch.setattr(adapter.asyncio, "create_subprocess_exec", AsyncMock(return_value=process))
+    assert run(adapter.host_resources()) == {"cpus": 2, "memory_mb": 8192, "gpus": expected}
+
+
+@pytest.mark.parametrize("stage", ["preflight", "compose-up"])
+def test_unsatisfiable_resources_skip_the_task(tmp_path, monkeypatch, stage):
+    env = "cpus = 16\n" if stage == "preflight" else "cpus = 2\n"
+    task = make_task(tmp_path / "task", env=env)
+    config = tmp_path / "config.toml"
+    config.write_text('[coding_agent]\nmodel = "test-model"\n')
+    args = adapter.build_parser().parse_args(["--bundle", str(tmp_path), "--config", str(config)])
+    args.run_id = "test"
+    started = []
+
+    async def start(self, force_build=False):
+        started.append(self.task_env_config.docker_image)
+        raise environment.ResourceUnavailableError("Docker host cannot satisfy task resources")
+
+    provider = environment.PrebuiltDockerEnvironment
+    monkeypatch.setattr(provider, "_egress_control_kernel_support", classmethod(lambda cls: False))
+    for method in ("empty_dirs", "prepare_logs_for_host", "stop"):
+        monkeypatch.setattr(provider, method, AsyncMock())
+    monkeypatch.setattr(provider, "start", start)
+    monkeypatch.setattr(adapter, "cleanup_images", AsyncMock())
+    with pytest.raises(adapter.TaskSkipped, match="16 CPUs" if stage == "preflight" else "satisfy"):
+        run(
+            adapter.run_trial(
+                TaskConfig(path=task.paths.task_dir),
+                args=args,
+                run_dir=tmp_path / "run",
+                bundles={"linux/amd64": tmp_path / "bundle"},
+                initial_images=set(),
+                native="linux/amd64",
+                host=HOST,
+            )
+        )
+    assert started == ([] if stage == "preflight" else ["official:agent"])
+    adapter.cleanup_images.assert_awaited_once()
+
+
+def test_skipped_tasks_are_reported_without_failing_the_run(tmp_path, monkeypatch):
+    config = tmp_path / "config.toml"
+    config.write_text('[coding_agent]\nmodel = "test-model"\n')
+    args = adapter.build_parser().parse_args(
+        [
+            "--bundle",
+            str(tmp_path),
+            "--config",
+            str(config),
+            "--run-id",
+            "test",
+            "--output-dir",
+            str(tmp_path / "terminalbench"),
+        ]
+    )
+    tasks = [TaskConfig(path=tmp_path / name) for name in ["gpu", "ok"]]
+    monkeypatch.setattr(adapter, "load_tasks", AsyncMock(return_value=(tasks, {})))
+    monkeypatch.setattr(adapter, "docker", AsyncMock(return_value="aarch64"))
+    monkeypatch.setattr(adapter, "host_resources", AsyncMock(return_value=HOST))
+
+    async def trial(task, **kwargs):
+        if adapter.task_id(task) == "gpu":
+            raise adapter.TaskSkipped("environment needs 1 GPUs, host has 0")
+        return grade("ok", 1.0)
+
+    monkeypatch.setattr(adapter, "run_trial", trial)
+    assert run(adapter.evaluate(args, {})) == 0
+    run_dir = tmp_path / "terminalbench/test"
+    summary = json.loads((run_dir / "summary.json").read_text())
+    assert summary["skipped_ids"] == ["gpu"]
+    assert summary["skipped_reasons"] == {"gpu": "environment needs 1 GPUs, host has 0"}
+    assert summary["incomplete_ids"] == [] and summary["error_ids"] == []
+    assert (summary["accuracy"], summary["accuracy_on_runnable"]) == (0.5, 1.0)
+    assert (run_dir / "logs/attempts/gpu/1/skipped.log").is_file()
+    metadata = json.loads((run_dir / "run_metadata.json").read_text())
+    assert metadata["host_resources"] == HOST
+    assert metadata["timeout_profile"]["mode"] == "official"
+
+
+@pytest.mark.parametrize(
+    "stderr,resource",
+    [
+        ("Error response from daemon: range of CPUs is from 0.01 to 2.00", True),
+        ('could not select device driver "nvidia" with capabilities: [[gpu]]', True),
+        ("pull access denied for official:agent", False),
+    ],
+)
+def test_compose_up_resource_errors_are_classified(monkeypatch, stderr, resource):
+    instance = object.__new__(environment.PrebuiltDockerEnvironment)
+    instance.task_images = set()
+    compose = json.dumps({"services": {"main": {"image": "official:agent"}}})
+
+    async def parent(self, command, **kwargs):
+        if command[0] == "config":
+            return SimpleNamespace(stdout=compose)
+        raise RuntimeError(f"Docker compose command failed. Stderr: {stderr}")
+
+    monkeypatch.setattr(environment.DockerEnvironment, "_run_docker_compose_command", parent)
+    error = environment.ResourceUnavailableError if resource else RuntimeError
+    with pytest.raises(error) as caught:
+        run(instance._run_docker_compose_command(["up", "-d"]))
+    assert isinstance(caught.value, environment.ResourceUnavailableError) == resource

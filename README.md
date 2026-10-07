@@ -94,8 +94,10 @@ Agent 产物和日志保存到本地，再由官方独立评分环境验证，�
 默认不设置 `cwd`，适配器自动采用每道题官方环境的工作目录，无需逐题改配置。
 显式设置时必须使用容器中的绝对路径。需要 `curl`、Docker Compose、现有 Linux 运行包及宿主环境的 API 环境变量。
 任务镜像还需 GNU `timeout`，用于在评分前终止超时的 Agent。
-4.0 包含 GPU 和多容器任务：GPU 任务需要具备对应 GPU 的 Linux Docker 主机；
-不能因本机缺少 GPU 而降低官方任务的 GPU/内存配置。镜像与运行包平台自动匹配，优先本机架构。
+4.0 包含 GPU 和多容器任务，不会降低官方任务的 CPU/内存/GPU 配置。开跑前读取 Docker 主机的
+CPU、内存和 GPU，任务环境或评分环境的需求超出主机时直接跳过（不拉取镜像）；预检遗漏、
+在 `compose up` 阶段因资源不足失败的任务同样记为跳过，测评继续执行下一题。
+镜像与运行包平台自动匹配，优先本机架构。
 若任务需要 Harbor 本地构建的网络隔离辅助镜像，也会记录失败，以遵守只使用预构建环境的要求。
 
 官方测评包的依赖与本项目的 OpenAI SDK 版本不同，因此使用独立临时 Python 环境运行
@@ -114,10 +116,10 @@ uv run --no-project --python 3.12 --with harbor==0.24.0 \
 使用 `--task-ids <id> ...`（也支持 `--instance-ids`）选择任务；`--all` 或不设置
 选择参数时执行全部任务。`--dataset-path /path/to/tasks` 可运行已导出的本地 Harbor 任务包，
 包中必须包含官方预构建镜像信息。`--dataset` 和 `--dataset-version` 可显式选择发布包。
-默认做题及评分超时均为 **1800 秒**，与 SWE 默认预算一致，分别通过 `--timeout` 和
-`--test-timeout` 调整。4.0 的官方 Agent 预算为 8 小时；需要对齐官方时间预算时添加
-`--official-timeouts`，使用题目自身的 Agent/Verifier 时间限制。
-报告和 `run_metadata.json` 保存实际时间预算，默认 1800 秒的结果不能直接当作官方预算成绩。
+默认使用每道题官方的 Agent/Verifier 时间限制（多数题 Agent 预算为 8 小时）。
+`--timeout` 和 `--test-timeout` 可统一覆盖为固定秒数，此时 `run_metadata.json` 中
+`timeout_profile.mode` 记为 `custom`，结果不能直接当作官方预算成绩。
+`--official-timeouts` 已是默认行为，仅为兼容保留。
 
 每题串行运行一次，不使用 Harbor 的任务重试：下载本题镜像 → 放入 LHAgent → 做题 →
 保存轨迹和产物 → 官方评分 → 保存结果并清理 → 下一题。
@@ -127,13 +129,15 @@ uv run --no-project --python 3.12 --with harbor==0.24.0 \
 - `results.json`：汇总及原始 Harbor 评分结果。
 - `logs/run_evaluation/<run_id>/results.json`：汇总报告，与 SWE 官方报告目录层级对应。
 - `logs/run_evaluation/<run_id>/lhagent/<task_id>/report.json`：单题原始 Harbor 报告。
-- `summary.json`：resolved、unresolved、incomplete 汇总，准确率分母包含全部选中任务。
+- `summary.json`：resolved、unresolved、incomplete、skipped 汇总。`accuracy` 分母包含全部选中任务，
+  `accuracy_on_runnable` 分母扣除因主机资源不足而跳过的任务；`skipped_reasons` 记录跳过原因。
 - `predictions.jsonl`：成功完成评分的任务结果（不是 SWE 的补丁）。
 - `logs/attempts/<task_id>/1/`：stdout、stderr、错误日志及 `harbor/` 原始日志、锁文件和产物。
 - `logs/<run_id>.failures.json`：运行或评分失败记录。
 - `.lhagent/<task_id>/1/sessions/`：原始会话 JSONL，与 SWE 路径层级一致，失败时也尝试保存。
 
 测试未通过计为 unresolved；运行、超时或评分异常计为 incomplete，并返回非零退出码。
+因主机资源不足跳过的任务计为 skipped，不影响退出码。
 
 ## 🎯 项目亮点
 
