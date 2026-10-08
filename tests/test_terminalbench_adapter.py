@@ -168,6 +168,19 @@ def test_requires_prebuilt_images_for_agent_and_verifier(tmp_path):
         adapter.validate_prebuilt_task(task)
 
 
+def test_verifier_internet_does_not_change_agent_network_policy(tmp_path):
+    task = make_task(tmp_path / "network")
+    task.config.environment.network_mode = adapter.NetworkMode.NO_NETWORK
+    task.config.verifier.network_mode = adapter.NetworkMode.NO_NETWORK
+    task.config.verifier.environment.network_mode = adapter.NetworkMode.NO_NETWORK
+
+    adapter.allow_verifier_internet(task)
+
+    assert task.config.environment.network_mode == adapter.NetworkMode.NO_NETWORK
+    assert task.config.verifier.network_mode == adapter.NetworkMode.PUBLIC
+    assert task.config.verifier.environment.network_mode == adapter.NetworkMode.PUBLIC
+
+
 @pytest.mark.parametrize("existing,cleanup_failure", [(True, False), (False, False), (False, True)])
 def test_cleanup_preserves_initial_images_and_records_failures(
     tmp_path, monkeypatch, existing, cleanup_failure
@@ -203,6 +216,27 @@ def test_cleanup_preserves_initial_images_and_records_failures(
         ["down", "--volumes", "--remove-orphans"]
     )
     assert (("image", "rm", "official:agent") in calls) == (not existing)
+
+
+def test_cleanup_retries_transient_image_removal_failure(tmp_path, monkeypatch):
+    attempt_dir = tmp_path / "attempt"
+    attempt_dir.mkdir()
+    (attempt_dir / "images.json").write_text('["official:task"]')
+    calls = 0
+
+    async def docker(*args):
+        nonlocal calls
+        if args[:2] == ("image", "inspect"):
+            return "sha256:new\n"
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("temporary Docker daemon error")
+        return ""
+
+    monkeypatch.setattr(environment, "docker", docker)
+    run(environment.cleanup_images(attempt_dir, set()))
+    assert calls == 2
+    assert not (attempt_dir / "cleanup-errors.json").exists()
 
 
 def grade(name, reward=1.0, error=None):
@@ -245,9 +279,9 @@ def test_serial_run_directories_summary_and_failures(tmp_path, monkeypatch, fail
                 raise RuntimeError("solve failed")
             if failure == "grade":
                 return grade(name, float("nan"))
-            if failure == "cleanup":
-                path = run_dir / "logs/attempts/first/1/cleanup-errors.json"
-                path.write_text('["cleanup failed"]')
+        if failure == "cleanup":
+            path = run_dir / "logs/attempts/first/1/cleanup-errors.json"
+            path.write_text('["cleanup failed"]')
         return grade(name, 1 if name == "first" else 0)
 
     monkeypatch.setattr(adapter, "run_trial", trial)
@@ -256,8 +290,17 @@ def test_serial_run_directories_summary_and_failures(tmp_path, monkeypatch, fail
     summary = json.loads((run_dir / "logs/run_evaluation/test/results.json").read_text())
     assert summary["total_instances"] == 2
     if failure == "cleanup":
-        assert events == [("first", "solve"), ("first", "grade"), ("first", "cleanup")]
-        assert summary["incomplete_ids"] == ["second"]
+        assert events == [
+            ("first", "solve"),
+            ("first", "grade"),
+            ("first", "cleanup"),
+            ("second", "solve"),
+            ("second", "grade"),
+            ("second", "cleanup"),
+        ]
+        assert summary["resolved_ids"] == ["first"]
+        assert summary["unresolved_ids"] == ["second"]
+        assert summary["error_ids"] == ["first"]
     elif failure:
         assert summary["incomplete_ids"] == ["first"]
         assert summary["unresolved_ids"] == ["second"]

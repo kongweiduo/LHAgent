@@ -180,7 +180,15 @@ async def cleanup_images(attempt_dir: Path, initial_images: set[str]):
                     continue
                 raise
             if image_id and image_id not in initial_images:
-                await docker("image", "rm", image)
+                for attempt in range(2):
+                    try:
+                        await docker("image", "rm", image)
+                        break
+                    except RuntimeError as exc:
+                        if "No such image" in str(exc) or "No such object" in str(exc):
+                            break
+                        if attempt:
+                            raise
     except Exception as exc:
         error_path = attempt_dir / "cleanup-errors.json"
         errors = json.loads(error_path.read_text()) if error_path.exists() else []

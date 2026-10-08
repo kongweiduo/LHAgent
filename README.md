@@ -88,7 +88,8 @@ uv run --with datasets --with swebench python -m lhagent.evals.benchmarks.sweben
 缓存在 `~/.cache/lhagent/terminalbench/4.0.0/`；Harbor 使用官方预构建镜像，
 将现有 LHAgent Linux 运行包放入容器后做题。
 Agent 产物和日志保存到本地，再由官方独立评分环境验证，沿用任务声明的资源和产物规则。
-任务环境、评分环境及辅助服务必须提供预构建镜像；缺失时记录失败，不自动构建。
+任务环境、评分环境及辅助服务必须提供预构建镜像；缺失时记录失败，不自动构建。评分环境允许联网，
+以支持需要从网络获取数据的官方验证；Agent 环境仍沿用任务自己的网络策略。
 
 将 `terminalbench.example.toml` 复制为 `terminalbench.toml`，填写模型参数。
 默认不设置 `cwd`，适配器自动采用每道题官方环境的工作目录，无需逐题改配置。
@@ -98,7 +99,6 @@ Agent 产物和日志保存到本地，再由官方独立评分环境验证，�
 CPU、内存和 GPU，任务环境或评分环境的需求超出主机时直接跳过（不拉取镜像）；预检遗漏、
 在 `compose up` 阶段因资源不足失败的任务同样记为跳过，测评继续执行下一题。
 镜像与运行包平台自动匹配，优先本机架构。
-若任务需要 Harbor 本地构建的网络隔离辅助镜像，也会记录失败，以遵守只使用预构建环境的要求。
 
 官方测评包的依赖与本项目的 OpenAI SDK 版本不同，因此使用独立临时 Python 环境运行
 测评 Harness，容器中的 Agent 则使用 `packaging/dist` 里的运行包：
@@ -123,7 +123,8 @@ uv run --no-project --python 3.12 --with harbor==0.24.0 \
 
 每题串行运行一次，不使用 Harbor 的任务重试：下载本题镜像 → 放入 LHAgent → 做题 →
 保存轨迹和产物 → 官方评分 → 保存结果并清理 → 下一题。
-清理仅针对本题 Compose 服务、卷及新增镜像，保留运行前已有镜像；清理失败停止后续任务。
+清理仅针对本题 Compose 服务、卷及新增镜像，保留运行前已有镜像；镜像删除遇到暂时性错误会重试一次，
+清理失败会记录在本题日志中并继续执行后续任务。
 不支持断点续跑，已有 `run_id` 不可覆盖。输出保存到 `terminalbench/<run_id>/`：
 
 - `results.json`：汇总及原始 Harbor 评分结果。

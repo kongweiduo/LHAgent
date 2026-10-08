@@ -16,7 +16,7 @@ import tomllib
 import uuid
 from pathlib import Path
 
-from harbor.models.task.config import TaskOS
+from harbor.models.task.config import NetworkMode, TaskOS
 from harbor.models.task.verifier_mode import resolve_verifier_environment_definition
 from harbor.models.trial.config import (
     AgentConfig,
@@ -173,6 +173,18 @@ def validate_prebuilt_task(task):
             raise ValueError("task has no official prebuilt verifier image; local builds disabled")
 
 
+def allow_verifier_internet(task):
+    """Run verifier environments with public networking, without changing agent policy."""
+    verifiers = [task.config.verifier]
+    verifiers.extend(step.verifier for step in task.config.steps or [])
+    for verifier in verifiers:
+        verifier.network_mode = NetworkMode.PUBLIC
+        verifier.allowed_hosts = None
+        if verifier.environment is not None:
+            verifier.environment.network_mode = NetworkMode.PUBLIC
+            verifier.environment.allowed_hosts = None
+
+
 class TaskSkipped(Exception):
     """The task cannot run on this Docker host; it is reported apart from failures."""
 
@@ -264,6 +276,7 @@ async def run_trial(task, *, args, run_dir, bundles, initial_images, native, hos
     )
     trial = await Trial.create(config)
     try:
+        allow_verifier_internet(trial.task)
         validate_prebuilt_task(trial.task)
         shortfalls = resource_shortfalls(trial.task, host)
         if shortfalls:
@@ -291,8 +304,10 @@ async def run_trial(task, *, args, run_dir, bundles, initial_images, native, hos
                 if source.exists():
                     shutil.copy2(source, attempt_dir / f"{name}.{filename}")
         finally:
-            await cleanup_images(attempt_dir, initial_images)
-            trial._close_logger_handler()
+            try:
+                await cleanup_images(attempt_dir, initial_images)
+            finally:
+                trial._close_logger_handler()
 
 
 def summarize_run(
@@ -425,8 +440,10 @@ async def evaluate(args, bundles):
                     )
                 failures_path.write_text(json.dumps(errors, indent=2))
             if cleanup_path.exists():
-                print("Stopping before the next task because Docker cleanup failed.", flush=True)
-                break
+                print(
+                    f"Docker cleanup failed for {name}; continuing to the next task.",
+                    flush=True,
+                )
     report = summarize_run(
         run_dir,
         selected,
